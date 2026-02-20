@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"log/slog"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -541,6 +542,66 @@ func extractTimestamp(itemArr []interface{}) time.Time {
 	}
 
 	return time.UnixMilli(best)
+}
+
+// ExtractMotionPhoto checks if a JPEG contains a valid embedded MP4 video.
+// Google Photos CDN often strips the actual video bytes while preserving XMP metadata,
+// so we only extract when a real MP4 (ftyp box) is confirmed present.
+// Always strips motion photo XMP flags so Immich does not attempt broken server-side extraction.
+// Returns image bytes, video bytes, and whether a valid motion video was found.
+func ExtractMotionPhoto(data []byte, logger *slog.Logger) ([]byte, []byte, bool) {
+	// Scan for the ftyp MP4 magic bytes — this is the only reliable indicator
+	// that the embedded video data is actually present in the file.
+	// Google Photos CDN with =d often preserves XMP MotionPhoto metadata but
+	// strips the actual video bytes (known issue, see Immich #9993).
+	ftypMagic := []byte("ftyp")
+	lastFtyp := bytes.LastIndex(data, ftypMagic)
+
+	// The ftyp must be after a reasonable image header (>4KB) and have 4 bytes
+	// before it for the MP4 box size field
+	if lastFtyp >= 8 && lastFtyp > 4096 {
+		videoStart := lastFtyp - 4
+		videoSize := len(data) - videoStart
+
+		// Validate: box size should be reasonable (8 bytes to 1MB) and video should be > 1KB
+		boxSize := int(data[videoStart])<<24 | int(data[videoStart+1])<<16 | int(data[videoStart+2])<<8 | int(data[videoStart+3])
+		if boxSize >= 8 && boxSize <= 1024*1024 && videoSize > 1024 {
+			videoData := data[videoStart:]
+			imageData := make([]byte, videoStart)
+			copy(imageData, data[:videoStart])
+			StripMotionPhotoXMP(imageData)
+
+			logger.Debug("Motion photo extracted",
+				"image_size", videoStart,
+				"video_size", videoSize,
+				"ftyp_offset", lastFtyp,
+			)
+			return imageData, videoData, true
+		}
+	}
+
+	// No valid embedded video found — strip XMP flags so Immich won't try to extract
+	logger.Debug("No embedded video found, stripping motion photo XMP flags",
+		"file_size", len(data),
+		"ftyp_found", lastFtyp >= 0,
+	)
+	StripMotionPhotoXMP(data)
+	return data, nil, false
+}
+
+// StripMotionPhotoXMP disables motion photo flags in XMP metadata (same-length replacements)
+func StripMotionPhotoXMP(data []byte) {
+	replacements := []struct{ old, new []byte }{
+		{[]byte(`MotionPhoto="1"`), []byte(`MotionPhoto="0"`)},
+		{[]byte(`MicroVideo="1"`), []byte(`MicroVideo="0"`)},
+		{[]byte("MotionPhoto>1<"), []byte("MotionPhoto>0<")},
+		{[]byte("MicroVideo>1<"), []byte("MicroVideo>0<")},
+	}
+	for _, r := range replacements {
+		if idx := bytes.Index(data, r.old); idx != -1 {
+			copy(data[idx:], r.new)
+		}
+	}
 }
 
 // extensionFromContentType maps Content-Type to file extension

@@ -149,6 +149,11 @@ func (c *Client) requestWithReader(method string, path string, bodyReader io.Rea
 }
 
 func (c *Client) UploadAssetStream(reader io.Reader, filename string, size int64, createdAt time.Time, description string) (string, bool, error) {
+	return c.UploadAssetStreamWithLive(reader, filename, size, createdAt, description, "")
+}
+
+// UploadAssetStreamWithLive uploads an asset and optionally links it to a live photo video
+func (c *Client) UploadAssetStreamWithLive(reader io.Reader, filename string, size int64, createdAt time.Time, description string, livePhotoVideoId string) (string, bool, error) {
 	pr, pw := io.Pipe()
 	multipartWriter := multipart.NewWriter(pw)
 
@@ -170,6 +175,9 @@ func (c *Client) UploadAssetStream(reader io.Reader, filename string, size int64
 		_ = multipartWriter.WriteField("isFavorite", "false")
 		if description != "" {
 			_ = multipartWriter.WriteField("description", description)
+		}
+		if livePhotoVideoId != "" {
+			_ = multipartWriter.WriteField("livePhotoVideoId", livePhotoVideoId)
 		}
 
 		part, err := multipartWriter.CreateFormFile("assetData", filename)

@@ -1,7 +1,9 @@
 package app
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"strings"
@@ -369,6 +371,66 @@ func (a *App) processItem(p googlephotos.Photo, albumTitle, albumURL string, exi
 	if p.TakenAt.IsZero() {
 		a.Logger.Warn("Uploading item with missing metadata date (using current time)",
 			"id", safeId, "url", p.URL, "is_video", isVideo)
+	}
+
+	// For images: buffer data and handle motion photos safely
+	if !isVideo {
+		data, readErr := io.ReadAll(r)
+		r.Close()
+		if readErr != nil {
+			return "", false, bytesDownloaded, 0, fmt.Errorf("error reading item data: %w", readErr)
+		}
+
+		// ExtractMotionPhoto also strips MotionPhoto XMP flags to prevent Immich extraction errors
+		imageData, videoData, isMotion := googlephotos.ExtractMotionPhoto(data, a.Logger)
+
+		if isMotion {
+			a.Logger.Info("Detected motion photo",
+				"id", safeId,
+				"total_size", len(data),
+				"image_size", len(imageData),
+				"video_size", len(videoData),
+			)
+
+			// Upload the video part first
+			videoFilename := baseName + ".mp4"
+			videoId, _, videoErr := a.Client.UploadAssetStream(
+				io.NopCloser(bytes.NewReader(videoData)),
+				videoFilename, int64(len(videoData)), p.TakenAt, "")
+			if videoErr != nil {
+				a.Logger.Warn("Failed to upload motion video, uploading image as static photo", "error", videoErr)
+			}
+
+			// Upload the image linked to the video
+			var uploadedId string
+			var isDup bool
+			imgReader := io.NopCloser(bytes.NewReader(imageData))
+			if videoId != "" {
+				uploadedId, isDup, err = a.Client.UploadAssetStreamWithLive(
+					imgReader, filename, int64(len(imageData)), p.TakenAt, description, videoId)
+			} else {
+				uploadedId, isDup, err = a.Client.UploadAssetStream(
+					imgReader, filename, int64(len(imageData)), p.TakenAt, description)
+			}
+			if err != nil {
+				return "", false, bytesDownloaded, 0, fmt.Errorf("error uploading %s: %w", filename, err)
+			}
+			if uploadedId == "" {
+				return "", false, bytesDownloaded, 0, fmt.Errorf("upload returned empty ID for %s", filename)
+			}
+
+			bytesUploaded := int64(len(imageData) + len(videoData))
+			if isDup {
+				a.Logger.Debug("Motion photo deduplicated by Immich", "filename", filename, "id", uploadedId)
+				return uploadedId, false, bytesDownloaded, bytesUploaded, nil
+			}
+			a.Logger.Info("Uploaded motion photo", "filename", filename, "video_id", videoId, "id", uploadedId)
+			return uploadedId, true, bytesDownloaded, bytesUploaded, nil
+		}
+
+		// Not a motion photo (or invalid extraction) — XMP flags already stripped by ExtractMotionPhoto
+		r = io.NopCloser(bytes.NewReader(imageData))
+		size = int64(len(imageData))
 	}
 
 	uploadedId, isDup, err := a.Client.UploadAssetStream(r, filename, size, p.TakenAt, description)
