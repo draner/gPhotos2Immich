@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"warreth.dev/immich-sync/pkg/googlephotos"
 	"warreth.dev/immich-sync/pkg/immich"
 	"warreth.dev/immich-sync/pkg/progress"
+	"warreth.dev/immich-sync/pkg/state"
 	"warreth.dev/immich-sync/pkg/util"
 )
 
@@ -21,6 +23,7 @@ type App struct {
 	Client   *immich.Client
 	GPClient *googlephotos.Client
 	Logger   *slog.Logger
+	State    *state.SyncState
 }
 
 func New(cfg *config.Config) (*App, error) {
@@ -48,11 +51,24 @@ func New(cfg *config.Config) (*App, error) {
 	}
 	client := immich.NewClient(cfg.ApiURL, cfg.ApiKey, workers)
 	gpClient := googlephotos.NewClient(logger, workers)
+
+	// Initialize persistent dedup state
+	dataDir := cfg.DataDir
+	if dataDir == "" {
+		dataDir = "./data"
+	}
+	syncState := state.New(filepath.Join(dataDir, "sync-state.json"))
+	if err := syncState.Load(); err != nil {
+		logger.Warn("Failed to load sync state, starting fresh", "error", err)
+	}
+	logger.Info("Loaded persistent dedup state", "entries", syncState.Count())
+
 	return &App{
 		Cfg:      cfg,
 		Client:   client,
 		GPClient: gpClient,
 		Logger:   logger,
+		State:    syncState,
 	}, nil
 }
 
@@ -230,6 +246,9 @@ func (a *App) processAlbum(ctx context.Context, ac config.GooglePhotosConfig, al
 	albumId := a.resolveAlbumID(ctx, ac, albumTitle, albumCache, logger)
 	existingFiles := a.prefetchAlbumAssets(ctx, albumId, logger)
 
+	// Log dedup cache state for diagnostics
+	logger.Info("Dedup cache loaded", "album_assets", len(existingFiles), "global_assets", len(globalAssets))
+
 	var newAssetIds []string
 
 	total := len(album.Photos)
@@ -348,6 +367,11 @@ func (a *App) processAlbum(ctx context.Context, ac config.GooglePhotosConfig, al
 	if a.Cfg.Debug {
 		logger.Info("Sync finished", "added", added, "skipped", skipped, "failed", failed, "total", processed)
 	}
+
+	// Persist dedup state to disk after each album
+	if err := a.State.Save(); err != nil {
+		logger.Warn("Failed to save dedup state", "error", err)
+	}
 }
 
 func (a *App) processItem(ctx context.Context, p googlephotos.Photo, albumTitle, albumURL string, existingFiles map[string]string, globalAssets map[string]string) (string, bool, int64, int64, error) {
@@ -355,17 +379,32 @@ func (a *App) processItem(ctx context.Context, p googlephotos.Photo, albumTitle,
 	safeId = strings.ReplaceAll(safeId, ":", "_")
 	baseName := fmt.Sprintf("gp_%s", safeId)
 
-	// O(1) check against pre-fetched album assets
+	// O(1) dedup checks against Immich (album-level and global device search).
+	// These maps are fetched from the Immich API at the start of each sync cycle,
+	// so they persist across container restarts — this is NOT an in-memory-only cache.
 	if assetId, exists := existingFiles[baseName]; exists {
-		a.Logger.Debug("Asset already in album", "id", assetId, "filename", baseName)
+		a.Logger.Debug("Asset already in album (Immich album lookup)", "id", assetId, "filename", baseName)
 		return "", false, 0, 0, nil
 	}
 
-	// O(1) check against global Immich assets — avoids re-downloading and re-uploading
 	if assetId, exists := globalAssets[baseName]; exists {
-		a.Logger.Debug("Asset exists in Immich globally, adding to album", "id", assetId, "filename", baseName)
+		a.Logger.Debug("Asset exists in Immich (device search), adding to album", "id", assetId, "filename", baseName)
 		return assetId, false, 0, 0, nil
 	}
+
+	// Check persistent local state (survives container restarts).
+	// Catches assets that exist in Immich under a different deviceId/filename.
+	if assetId, exists := a.State.Get(baseName); exists {
+		a.Logger.Debug("Asset found in persistent dedup cache", "id", assetId, "filename", baseName)
+		return assetId, false, 0, 0, nil
+	}
+
+	a.Logger.Warn("Asset not found in Immich dedup, will download and re-upload",
+		"baseName", baseName,
+		"gp_item_id", p.ID,
+		"album_assets_count", len(existingFiles),
+		"global_assets_count", len(globalAssets),
+	)
 
 	if a.Cfg.StrictMetadata && p.TakenAt.IsZero() {
 		a.Logger.Warn("Skipping item with missing metadata date",
@@ -374,7 +413,7 @@ func (a *App) processItem(ctx context.Context, p googlephotos.Photo, albumTitle,
 	}
 
 	// Download original media from Google Photos (returns buffered []byte)
-	a.Logger.Debug("Downloading item", "id", safeId)
+	a.Logger.Info("Downloading item", "id", safeId)
 	data, ext, isVideo, err := googlephotos.DownloadMedia(ctx, a.GPClient, p.URL)
 	if err != nil {
 		return "", false, 0, 0, fmt.Errorf("error downloading item: %w", err)
@@ -416,10 +455,12 @@ func (a *App) processItem(ctx context.Context, p googlephotos.Photo, albumTitle,
 
 			// Upload the video part first
 			videoFilename := baseName + ".mp4"
-			videoId, _, videoErr := a.Client.UploadAsset(ctx,
+			videoId, videoDup, videoErr := a.Client.UploadAsset(ctx,
 				videoData, videoFilename, p.TakenAt, "")
 			if videoErr != nil {
 				a.Logger.Warn("Failed to upload motion video, uploading image as static photo", "error", videoErr)
+			} else if videoDup {
+				a.Logger.Debug("Motion video deduplicated by Immich", "filename", videoFilename, "id", videoId)
 			}
 
 			// Upload the image linked to the video
@@ -440,8 +481,10 @@ func (a *App) processItem(ctx context.Context, p googlephotos.Photo, albumTitle,
 			}
 
 			bytesUploaded := int64(len(imageData) + len(videoData))
+			a.State.Set(baseName, uploadedId)
 			if isDup {
-				a.Logger.Debug("Motion photo deduplicated by Immich", "filename", filename, "id", uploadedId)
+				a.Logger.Warn("Motion photo deduplicated by Immich (re-downloaded unnecessarily)",
+					"filename", filename, "id", uploadedId, "baseName", baseName)
 				return uploadedId, false, bytesDownloaded, bytesUploaded, nil
 			}
 			a.Logger.Info("Uploaded motion photo", "filename", filename, "video_id", videoId, "id", uploadedId)
@@ -461,13 +504,15 @@ func (a *App) processItem(ctx context.Context, p googlephotos.Photo, albumTitle,
 	}
 
 	bytesUploaded := int64(len(data))
+	a.State.Set(baseName, uploadedId)
 
 	if isDup {
-		a.Logger.Debug("Asset deduplicated by Immich", "filename", filename, "id", uploadedId)
+		a.Logger.Warn("Asset deduplicated by Immich (was re-downloaded unnecessarily, dedup pre-check missed it)",
+			"filename", filename, "id", uploadedId, "baseName", baseName)
 		return uploadedId, false, bytesDownloaded, bytesUploaded, nil
 	}
 
-	a.Logger.Debug("Uploaded item", "filename", filename, "id", uploadedId)
+	a.Logger.Info("Uploaded item", "filename", filename, "id", uploadedId)
 	return uploadedId, true, bytesDownloaded, bytesUploaded, nil
 }
 

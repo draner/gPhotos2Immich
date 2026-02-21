@@ -9,4 +9,5 @@ services:
       # - IMMICH_READD_TRASHED_ITEMS=true # If not using config.json, set to true to re-upload trashed items
     volumes:
       - ./config.json:/app/config.json # Mount the config file (create it with your settings)
+      - ./data:/app/data # Persistent dedup state (survives container restarts)
     restart: unless-stopped

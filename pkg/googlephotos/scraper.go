@@ -553,16 +553,37 @@ func extractTimestamp(itemArr []interface{}) time.Time {
 	return time.UnixMilli(best)
 }
 
+// hasMotionPhotoXMP checks if data contains any motion photo XMP markers
+func hasMotionPhotoXMP(data []byte) bool {
+	markers := [][]byte{
+		[]byte(`MotionPhoto="1"`),
+		[]byte(`MicroVideo="1"`),
+		[]byte("MotionPhoto>1<"),
+		[]byte("MicroVideo>1<"),
+	}
+	for _, m := range markers {
+		if bytes.Contains(data, m) {
+			return true
+		}
+	}
+	return false
+}
+
 // ExtractMotionPhoto checks if a JPEG contains a valid embedded MP4 video.
 // Google Photos CDN often strips the actual video bytes while preserving XMP metadata,
 // so we only extract when a real MP4 (ftyp box) is confirmed present.
-// Always strips motion photo XMP flags so Immich does not attempt broken server-side extraction.
+// Only strips motion photo XMP flags when markers are actually found, preserving the
+// original file bytes (and thus checksum) for regular photos without motion XMP.
 // Returns image bytes, video bytes, and whether a valid motion video was found.
 func ExtractMotionPhoto(data []byte, logger *slog.Logger) ([]byte, []byte, bool) {
-	// Scan for the ftyp MP4 magic bytes — this is the only reliable indicator
-	// that the embedded video data is actually present in the file.
-	// Google Photos CDN with =d often preserves XMP MotionPhoto metadata but
-	// strips the actual video bytes (known issue, see Immich #9993).
+	// Check if this image has any motion photo XMP markers at all.
+	// If not, return the original data unchanged to preserve the checksum
+	// for Immich's native duplicate detection.
+	if !hasMotionPhotoXMP(data) {
+		return data, nil, false
+	}
+
+	// Image has motion photo XMP markers — check if actual video data is embedded
 	ftypMagic := []byte("ftyp")
 	lastFtyp := bytes.LastIndex(data, ftypMagic)
 
@@ -589,8 +610,9 @@ func ExtractMotionPhoto(data []byte, logger *slog.Logger) ([]byte, []byte, bool)
 		}
 	}
 
-	// No valid embedded video found — strip XMP flags so Immich won't try to extract
-	logger.Debug("No embedded video found, stripping motion photo XMP flags",
+	// Has motion photo XMP markers but no valid embedded video.
+	// Strip the XMP flags so Immich does not attempt broken server-side extraction.
+	logger.Info("Motion photo XMP found but no embedded video, stripping XMP flags",
 		"file_size", len(data),
 		"ftyp_found", lastFtyp >= 0,
 	)
@@ -645,45 +667,97 @@ func extensionFromContentType(contentType string) string {
 	}
 }
 
+// isVideoMagicBytes checks if data starts with known video container signatures
+func isVideoMagicBytes(data []byte) bool {
+	if len(data) < 12 {
+		return false
+	}
+	// MP4/MOV: ftyp box at offset 4
+	if string(data[4:8]) == "ftyp" {
+		return true
+	}
+	// WebM/Matroska: EBML header
+	if data[0] == 0x1A && data[1] == 0x45 && data[2] == 0xDF && data[3] == 0xA3 {
+		return true
+	}
+	// AVI: RIFF....AVI
+	if string(data[0:4]) == "RIFF" && len(data) >= 12 && string(data[8:12]) == "AVI " {
+		return true
+	}
+	return false
+}
+
 // DownloadMedia downloads original media from Google Photos.
-// Fetches with =d first and checks Content-Type headers to detect videos (avoiding a separate HEAD probe).
-// Videos are re-fetched with =dv for proper download.
+// First probes =dv with HEAD to reliably detect videos (Google CDN may return a JPEG
+// poster frame for videos via =d with an image Content-Type).
 // Returns: data, extension (e.g. ".jpg"), isVideo, error
 func DownloadMedia(ctx context.Context, client *Client, baseUrl string) ([]byte, string, bool, error) {
-	// Fetch with =d (original quality, preserves motion photo data for images)
+	// Probe =dv (video download) with HEAD to detect video items before fetching the body.
+	// Google Photos serves videos via =dv and images via =d. Without this probe,
+	// video items fetched with =d often return a JPEG poster frame, causing videos
+	// to be incorrectly uploaded as .jpg files.
+	headResp, headErr := client.Head(ctx, baseUrl+"=dv")
+	if headErr == nil {
+		headResp.Body.Close()
+		dvCt := strings.ToLower(headResp.Header.Get("Content-Type"))
+		if headResp.StatusCode == 200 && strings.HasPrefix(dvCt, "video/") {
+			// Confirmed video, download with =dv
+			resp, err := client.Get(ctx, baseUrl+"=dv")
+			if err != nil {
+				return nil, "", false, fmt.Errorf("video download failed: %w", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != 200 {
+				return nil, "", false, fmt.Errorf("video download returned status %d", resp.StatusCode)
+			}
+			ct := resp.Header.Get("Content-Type")
+			data, err := io.ReadAll(resp.Body)
+			if err != nil {
+				return nil, "", false, fmt.Errorf("failed to read video response body: %w", err)
+			}
+			ext := extensionFromContentType(ct)
+			return data, ext, true, nil
+		}
+	}
+
+	// Not a video (or HEAD probe failed/inconclusive), download as image with =d
 	resp, err := client.Get(ctx, baseUrl+"=d")
 	if err != nil {
 		return nil, "", false, fmt.Errorf("download failed: %w", err)
 	}
+	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		resp.Body.Close()
 		return nil, "", false, fmt.Errorf("download returned status %d", resp.StatusCode)
 	}
 
 	ct := resp.Header.Get("Content-Type")
-	isVideo := strings.HasPrefix(strings.ToLower(ct), "video/")
-
-	// Videos need =dv suffix for proper download
-	if isVideo {
-		resp.Body.Close()
-		resp, err = client.Get(ctx, baseUrl+"=dv")
-		if err != nil {
-			return nil, "", false, fmt.Errorf("video download failed: %w", err)
-		}
-		if resp.StatusCode != 200 {
-			resp.Body.Close()
-			return nil, "", false, fmt.Errorf("video download returned status %d", resp.StatusCode)
-		}
-		ct = resp.Header.Get("Content-Type")
-	}
-	defer resp.Body.Close()
-
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, "", false, fmt.Errorf("failed to read response body: %w", err)
 	}
 
+	// Safety net: check Content-Type and magic bytes for videos that slipped through the HEAD probe
+	isVideo := strings.HasPrefix(strings.ToLower(ct), "video/") || isVideoMagicBytes(data)
+	if isVideo {
+		// Re-download with =dv for proper video data
+		resp2, err := client.Get(ctx, baseUrl+"=dv")
+		if err != nil {
+			return nil, "", false, fmt.Errorf("video re-download failed: %w", err)
+		}
+		defer resp2.Body.Close()
+		if resp2.StatusCode == 200 {
+			videoCt := resp2.Header.Get("Content-Type")
+			videoData, err := io.ReadAll(resp2.Body)
+			if err != nil {
+				return nil, "", false, fmt.Errorf("failed to read video response body: %w", err)
+			}
+			ext := extensionFromContentType(videoCt)
+			return videoData, ext, true, nil
+		}
+		// =dv failed, fall through and use the =d data as-is
+	}
+
 	ext := extensionFromContentType(ct)
-	return data, ext, isVideo, nil
+	return data, ext, false, nil
 }

@@ -23,6 +23,7 @@ type Config struct {
 	AlbumWorkers   int                  `json:"albumWorkers"`   // Optional, concurrent album processing (default 1)
 	StrictMetadata bool                 `json:"strictMetadata"` // Optional, skip items with missing dates
 	SkipVideos     bool                 `json:"skipVideos"`     // Optional, skip video items entirely
+	DataDir        string               `json:"dataDir"`        // Optional, directory for persistent state (default "./data")
 	GooglePhotos   []GooglePhotosConfig `json:"googlePhotos"`
 }
 
