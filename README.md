@@ -19,6 +19,7 @@ Sync photos from Google Photos shared albums to your [Immich](https://immich.app
        restart: unless-stopped
        volumes:
          - ./config.json:/app/config.json
+         - ./data:/app/data # Persistent dedup cache (survives container restarts)
    ```
 
    ```bash
@@ -57,8 +58,7 @@ Your Immich API key needs these permissions (or use "All"):
     {
       "url": "https://photos.app.goo.gl/ExistingAlbumLink",
       "immichAlbumId": "existing-album-uuid",
-      "syncInterval": "1h",
-      "immichAlbumId": "existing-immich-album-id"
+      "syncInterval": "1h"
     }
   ]
 }
@@ -96,7 +96,7 @@ Your Immich API key needs these permissions (or use "All"):
 - **Smart date detection.** Extracts the original "taken" date from metadata.
 - **Strict metadata mode.** Optionally skip items with missing dates instead of falling back to the current date.
 - **Rate limit protection.** Jitter and exponential backoff to avoid Google Photos throttling.
-- **Duplicate detection.** Pre-fetches existing album assets for O(1) dedup. Respects Immich trash.
+- **Duplicate detection.** Pre-fetches existing album assets for O(1) dedup. Persistent local cache (`./data/sync-state.json`) survives container restarts. Respects Immich trash.
 
 > **Note:** Motion/Live photos are imported as still images. The embedded video component is stripped so Immich handles them without errors.
 
