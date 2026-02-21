@@ -1,3 +1,5 @@
 config.json
 json
 main
+data
+data/sync-state.json
