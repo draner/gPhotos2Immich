@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"warreth.dev/immich-sync/pkg/util"
 )
 
 const (
@@ -160,7 +162,10 @@ func (c *Client) GetAlbum(ctx context.Context, albumId string) (*Album, error) {
 
 func (c *Client) CreateAlbum(ctx context.Context, name string) (*Album, error) {
 	payload := map[string]string{"albumName": name}
-	jsonPayload, _ := json.Marshal(payload)
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal create album payload: %w", err)
+	}
 	body, err := c.request(ctx, "POST", "albums", jsonPayload, "")
 	if err != nil {
 		return nil, err
@@ -190,8 +195,11 @@ func (c *Client) AddAssetsToAlbum(ctx context.Context, albumId string, assetIds 
 
 		chunk := assetIds[i:end]
 		payload := map[string]interface{}{"ids": chunk}
-		jsonPayload, _ := json.Marshal(payload)
-		_, err := c.request(ctx, "PUT", fmt.Sprintf("albums/%s/assets", albumId), jsonPayload, "")
+		jsonPayload, err := json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("failed to marshal add assets payload: %w", err)
+		}
+		_, err = c.request(ctx, "PUT", fmt.Sprintf("albums/%s/assets", albumId), jsonPayload, "")
 		if err != nil {
 			return err
 		}
@@ -321,7 +329,10 @@ func (c *Client) SearchAssetsByDevice(ctx context.Context, deviceId string) (map
 			"page":     page,
 			"size":     pageSize,
 		}
-		jsonPayload, _ := json.Marshal(payload)
+		jsonPayload, err := json.Marshal(payload)
+		if err != nil {
+			return result, fmt.Errorf("failed to marshal search payload: %w", err)
+		}
 
 		body, err := c.request(ctx, "POST", "search/metadata", jsonPayload, "")
 		if err != nil {
@@ -342,10 +353,7 @@ func (c *Client) SearchAssetsByDevice(ctx context.Context, deviceId string) (map
 		}
 
 		for _, asset := range searchResp.Assets.Items {
-			name := asset.OriginalFileName
-			if dot := strings.LastIndex(name, "."); dot != -1 {
-				name = name[:dot]
-			}
+			name := util.StripExtension(asset.OriginalFileName)
 			result[name] = asset.Id
 		}
 

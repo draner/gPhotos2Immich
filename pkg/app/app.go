@@ -13,6 +13,7 @@ import (
 	"warreth.dev/immich-sync/pkg/googlephotos"
 	"warreth.dev/immich-sync/pkg/immich"
 	"warreth.dev/immich-sync/pkg/progress"
+	"warreth.dev/immich-sync/pkg/util"
 )
 
 type App struct {
@@ -102,11 +103,18 @@ func (a *App) Run(ctx context.Context) error {
 		}
 
 		if len(due) > 0 {
-			// Fetch album list from Immich once per sync cycle
+			// Fetch album list and global assets from Immich once per sync cycle
 			albumCache, err := a.Client.GetAlbums(ctx)
 			if err != nil {
 				a.Logger.Warn("Failed to fetch Immich album list", "error", err)
 			}
+
+			globalAssets, err := a.Client.SearchAssetsByDevice(ctx, "immich-sync-go")
+			if err != nil {
+				a.Logger.Warn("Failed to fetch global assets, will fall back to re-upload for duplicates", "error", err)
+				globalAssets = make(map[string]string)
+			}
+			a.Logger.Debug("Pre-fetched global assets from Immich", "count", len(globalAssets))
 
 			a.Logger.Info("Processing due albums", "count", len(due), "album_workers", albumWorkers)
 
@@ -119,7 +127,7 @@ func (a *App) Run(ctx context.Context) error {
 					defer wg.Done()
 					sem <- struct{}{}
 					defer func() { <-sem }()
-					a.processAlbum(ctx, ac, albumCache)
+					a.processAlbum(ctx, ac, albumCache, globalAssets)
 				}(ac)
 			}
 			wg.Wait()
@@ -160,7 +168,45 @@ type processResult struct {
 	BytesUploaded   int64
 }
 
-func (a *App) processAlbum(ctx context.Context, ac config.GooglePhotosConfig, albumCache []immich.Album) {
+// resolveAlbumID finds or creates the Immich album for a given config entry
+func (a *App) resolveAlbumID(ctx context.Context, ac config.GooglePhotosConfig, albumTitle string, albumCache []immich.Album, logger *slog.Logger) string {
+	if ac.ImmichAlbumID != "" {
+		return ac.ImmichAlbumID
+	}
+	for _, album := range albumCache {
+		if album.AlbumName == albumTitle {
+			return album.Id
+		}
+	}
+	logger.Info("Creating Immich album", "title", albumTitle)
+	newAlbum, err := a.Client.CreateAlbum(ctx, albumTitle)
+	if err != nil {
+		logger.Error("Error creating album", "error", err)
+		return ""
+	}
+	return newAlbum.Id
+}
+
+// prefetchAlbumAssets fetches existing asset names from an Immich album for deduplication
+func (a *App) prefetchAlbumAssets(ctx context.Context, albumId string, logger *slog.Logger) map[string]string {
+	existingFiles := make(map[string]string)
+	if albumId == "" {
+		return existingFiles
+	}
+	albumDetails, err := a.Client.GetAlbum(ctx, albumId)
+	if err != nil {
+		logger.Warn("Failed to fetch album details", "error", err)
+		return existingFiles
+	}
+	for _, asset := range albumDetails.Assets {
+		name := util.StripExtension(asset.OriginalFileName)
+		existingFiles[name] = asset.Id
+	}
+	logger.Debug("Pre-fetched album assets", "count", len(existingFiles))
+	return existingFiles
+}
+
+func (a *App) processAlbum(ctx context.Context, ac config.GooglePhotosConfig, albumCache []immich.Album, globalAssets map[string]string) {
 	logger := a.Logger.With("album_url", ac.URL)
 	logger.Info("Syncing Google Photos Album")
 
@@ -181,64 +227,8 @@ func (a *App) processAlbum(ctx context.Context, ac config.GooglePhotosConfig, al
 		return
 	}
 
-	// Resolve Immich album ID
-	var albumId string
-	if ac.ImmichAlbumID != "" {
-		albumId = ac.ImmichAlbumID
-	} else {
-		for _, a := range albumCache {
-			if a.AlbumName == albumTitle {
-				albumId = a.Id
-				break
-			}
-		}
-		if albumId == "" {
-			logger.Info("Creating Immich album", "title", albumTitle)
-			newAlbum, err := a.Client.CreateAlbum(ctx, albumTitle)
-			if err == nil {
-				albumId = newAlbum.Id
-			} else {
-				logger.Error("Error creating album", "error", err)
-			}
-		}
-	}
-
-	// Parallel prefetch: fetch album assets and global assets concurrently
-	existingFiles := make(map[string]string)
-	globalAssets := make(map[string]string)
-
-	var prefetchWg sync.WaitGroup
-	if albumId != "" {
-		prefetchWg.Add(1)
-		go func() {
-			defer prefetchWg.Done()
-			albumDetails, err := a.Client.GetAlbum(ctx, albumId)
-			if err == nil {
-				for _, asset := range albumDetails.Assets {
-					name := asset.OriginalFileName
-					if dot := strings.LastIndex(name, "."); dot != -1 {
-						name = name[:dot]
-					}
-					existingFiles[name] = asset.Id
-				}
-				logger.Debug("Pre-fetched album assets", "count", len(existingFiles))
-			}
-		}()
-	}
-
-	prefetchWg.Add(1)
-	go func() {
-		defer prefetchWg.Done()
-		assets, err := a.Client.SearchAssetsByDevice(ctx, "immich-sync-go")
-		if err != nil {
-			logger.Warn("Failed to fetch global assets, will fall back to re-upload for duplicates", "error", err)
-			return
-		}
-		globalAssets = assets
-		logger.Debug("Pre-fetched global assets from Immich", "count", len(globalAssets))
-	}()
-
-	prefetchWg.Wait()
+	albumId := a.resolveAlbumID(ctx, ac, albumTitle, albumCache, logger)
+	existingFiles := a.prefetchAlbumAssets(ctx, albumId, logger)
 
 	var newAssetIds []string
 
@@ -279,14 +269,14 @@ func (a *App) processAlbum(ctx context.Context, ac config.GooglePhotosConfig, al
 
 	// Feed jobs with context cancellation support
 	go func() {
+		defer close(jobs)
 		for _, p := range album.Photos {
 			select {
 			case <-ctx.Done():
-				break
+				return
 			case jobs <- p:
 			}
 		}
-		close(jobs)
 	}()
 
 	// Close results after all workers finish
@@ -316,7 +306,7 @@ func (a *App) processAlbum(ctx context.Context, ac config.GooglePhotosConfig, al
 			if res.WasUploaded {
 				added++
 				wasAdded = true
-			} else if res.ID == "" {
+			} else {
 				skipped++
 				wasSkipped = true
 			}
@@ -347,10 +337,11 @@ func (a *App) processAlbum(ctx context.Context, ac config.GooglePhotosConfig, al
 	// Stop tracker and print final summary
 	tracker.Stop()
 
-	// Final flush: add all assets to album (idempotent, catches any failures from incremental flushes)
-	if albumId != "" && len(newAssetIds) > 0 {
-		logger.Info("Finalizing album assets", "count", len(newAssetIds), "album", albumTitle)
-		if err := a.Client.AddAssetsToAlbum(ctx, albumId, newAssetIds); err != nil {
+	// Final flush: add remaining unflushed assets to album
+	if albumId != "" && len(newAssetIds) > lastFlushCount {
+		remaining := newAssetIds[lastFlushCount:]
+		logger.Info("Finalizing album assets", "count", len(remaining), "album", albumTitle)
+		if err := a.Client.AddAssetsToAlbum(ctx, albumId, remaining); err != nil {
 			logger.Error("Error adding assets to album", "error", err)
 		}
 	}
