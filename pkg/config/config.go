@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 )
 
 type GooglePhotosConfig struct {
@@ -60,4 +61,31 @@ func ReadConfig(path string) (*Config, error) {
 	if config.ApiURL == "" { config.ApiURL = os.Getenv("IMMICH_API_URL") }
 	
 	return &config, nil
+}
+
+// Validate checks that all required config fields are present and valid
+func (c *Config) Validate() error {
+	if c.ApiKey == "" {
+		return fmt.Errorf("apiKey is required (set in config or IMMICH_API_KEY env var)")
+	}
+	if c.ApiURL == "" {
+		return fmt.Errorf("apiURL is required (set in config or IMMICH_API_URL env var)")
+	}
+	if c.Workers < 0 {
+		return fmt.Errorf("workers must be non-negative")
+	}
+	if c.AlbumWorkers < 0 {
+		return fmt.Errorf("albumWorkers must be non-negative")
+	}
+	for i, gp := range c.GooglePhotos {
+		if gp.URL == "" {
+			return fmt.Errorf("googlePhotos[%d].url is required", i)
+		}
+		if gp.SyncInterval != "" {
+			if _, err := time.ParseDuration(gp.SyncInterval); err != nil {
+				return fmt.Errorf("googlePhotos[%d].syncInterval %q is invalid: %w", i, gp.SyncInterval, err)
+			}
+		}
+	}
+	return nil
 }

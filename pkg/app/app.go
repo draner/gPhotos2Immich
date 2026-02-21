@@ -1,9 +1,8 @@
 package app
 
 import (
-	"bytes"
+	"context"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"strings"
@@ -42,8 +41,12 @@ func New(cfg *config.Config) (*App, error) {
 		},
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stdout, opts))
-	client := immich.NewClient(cfg.ApiURL, cfg.ApiKey)
-	gpClient := googlephotos.NewClient(logger)
+	workers := cfg.Workers
+	if workers < 1 {
+		workers = 1
+	}
+	client := immich.NewClient(cfg.ApiURL, cfg.ApiKey, workers)
+	gpClient := googlephotos.NewClient(logger, workers)
 	return &App{
 		Cfg:      cfg,
 		Client:   client,
@@ -52,22 +55,21 @@ func New(cfg *config.Config) (*App, error) {
 	}, nil
 }
 
-func (a *App) Run() {
+func (a *App) Run(ctx context.Context) error {
 	a.Logger.Info("Starting Immich Sync")
 
-	id, name, err := a.Client.GetUser()
+	id, name, err := a.Client.GetUser(ctx)
 	if err != nil {
-		a.Logger.Error("Failed to connect to Immich", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("failed to connect to Immich: %w", err)
 	}
 	a.Logger.Info("Connected to Immich", "user_id", id, "name", name)
 
 	if len(a.Cfg.GooglePhotos) == 0 {
 		a.Logger.Warn("No albums configured")
-		return
+		return nil
 	}
 
-	// Initialize schedule
+	// Initialize schedule - all albums due immediately
 	nextRun := make(map[string]time.Time)
 	for _, ac := range a.Cfg.GooglePhotos {
 		nextRun[ac.URL] = time.Now()
@@ -79,17 +81,29 @@ func (a *App) Run() {
 	}
 
 	for {
-		// Collect albums due for sync
+		// Check for shutdown between cycles
+		select {
+		case <-ctx.Done():
+			a.Logger.Info("Shutdown requested, stopping sync loop")
+			return nil
+		default:
+		}
+
+		// Collect albums due for sync and find earliest next run
 		var due []config.GooglePhotosConfig
+		earliest := time.Now().Add(24 * time.Hour)
+
 		for _, ac := range a.Cfg.GooglePhotos {
-			if time.Now().After(nextRun[ac.URL]) {
+			if !time.Now().Before(nextRun[ac.URL]) {
 				due = append(due, ac)
+			} else if nextRun[ac.URL].Before(earliest) {
+				earliest = nextRun[ac.URL]
 			}
 		}
 
 		if len(due) > 0 {
 			// Fetch album list from Immich once per sync cycle
-			albumCache, err := a.Client.GetAlbums()
+			albumCache, err := a.Client.GetAlbums(ctx)
 			if err != nil {
 				a.Logger.Warn("Failed to fetch Immich album list", "error", err)
 			}
@@ -105,7 +119,7 @@ func (a *App) Run() {
 					defer wg.Done()
 					sem <- struct{}{}
 					defer func() { <-sem }()
-					a.processAlbum(ac, albumCache)
+					a.processAlbum(ctx, ac, albumCache)
 				}(ac)
 			}
 			wg.Wait()
@@ -119,9 +133,22 @@ func (a *App) Run() {
 				nextRun[ac.URL] = time.Now().Add(interval)
 				a.Logger.Info("Scheduled next sync", "album", ac.URL, "next_run", nextRun[ac.URL].Format("15:04:05"))
 			}
+			continue
 		}
 
-		time.Sleep(1 * time.Minute)
+		// Wait until the next album is due or context cancellation
+		waitDuration := time.Until(earliest)
+		if waitDuration < time.Second {
+			waitDuration = time.Second
+		}
+		a.Logger.Debug("Waiting for next sync cycle", "wait", waitDuration.Round(time.Second))
+
+		select {
+		case <-ctx.Done():
+			a.Logger.Info("Shutdown requested, stopping sync loop")
+			return nil
+		case <-time.After(waitDuration):
+		}
 	}
 }
 
@@ -133,11 +160,11 @@ type processResult struct {
 	BytesUploaded   int64
 }
 
-func (a *App) processAlbum(ac config.GooglePhotosConfig, albumCache []immich.Album) {
+func (a *App) processAlbum(ctx context.Context, ac config.GooglePhotosConfig, albumCache []immich.Album) {
 	logger := a.Logger.With("album_url", ac.URL)
 	logger.Info("Syncing Google Photos Album")
 
-	album, err := googlephotos.ScrapeAlbum(a.GPClient, ac.URL)
+	album, err := googlephotos.ScrapeAlbum(ctx, a.GPClient, ac.URL)
 	if err != nil {
 		logger.Error("Error scraping album", "error", err)
 		return
@@ -167,7 +194,7 @@ func (a *App) processAlbum(ac config.GooglePhotosConfig, albumCache []immich.Alb
 		}
 		if albumId == "" {
 			logger.Info("Creating Immich album", "title", albumTitle)
-			newAlbum, err := a.Client.CreateAlbum(albumTitle)
+			newAlbum, err := a.Client.CreateAlbum(ctx, albumTitle)
 			if err == nil {
 				albumId = newAlbum.Id
 			} else {
@@ -176,31 +203,42 @@ func (a *App) processAlbum(ac config.GooglePhotosConfig, albumCache []immich.Alb
 		}
 	}
 
-	// Pre-fetch existing album assets for O(1) duplicate detection
-	existingFiles := make(map[string]string) // baseName (no extension) -> asset ID
+	// Parallel prefetch: fetch album assets and global assets concurrently
+	existingFiles := make(map[string]string)
+	globalAssets := make(map[string]string)
+
+	var prefetchWg sync.WaitGroup
 	if albumId != "" {
-		albumDetails, err := a.Client.GetAlbum(albumId)
-		if err == nil {
-			for _, asset := range albumDetails.Assets {
-				name := asset.OriginalFileName
-				if dot := strings.LastIndex(name, "."); dot != -1 {
-					name = name[:dot]
+		prefetchWg.Add(1)
+		go func() {
+			defer prefetchWg.Done()
+			albumDetails, err := a.Client.GetAlbum(ctx, albumId)
+			if err == nil {
+				for _, asset := range albumDetails.Assets {
+					name := asset.OriginalFileName
+					if dot := strings.LastIndex(name, "."); dot != -1 {
+						name = name[:dot]
+					}
+					existingFiles[name] = asset.Id
 				}
-				existingFiles[name] = asset.Id
+				logger.Debug("Pre-fetched album assets", "count", len(existingFiles))
 			}
-			logger.Debug("Pre-fetched album assets", "count", len(existingFiles))
-		}
+		}()
 	}
 
-	// Pre-fetch all assets uploaded by this tool globally for O(1) lookup.
-	// Avoids re-downloading and re-uploading files that exist in Immich but not in this album.
-	globalAssets, err := a.Client.SearchAssetsByDevice("immich-sync-go")
-	if err != nil {
-		logger.Warn("Failed to fetch global assets, will fall back to re-upload for duplicates", "error", err)
-		globalAssets = make(map[string]string)
-	} else {
+	prefetchWg.Add(1)
+	go func() {
+		defer prefetchWg.Done()
+		assets, err := a.Client.SearchAssetsByDevice(ctx, "immich-sync-go")
+		if err != nil {
+			logger.Warn("Failed to fetch global assets, will fall back to re-upload for duplicates", "error", err)
+			return
+		}
+		globalAssets = assets
 		logger.Debug("Pre-fetched global assets from Immich", "count", len(globalAssets))
-	}
+	}()
+
+	prefetchWg.Wait()
 
 	var newAssetIds []string
 
@@ -233,16 +271,20 @@ func (a *App) processAlbum(ac config.GooglePhotosConfig, albumCache []immich.Alb
 		go func() {
 			defer wg.Done()
 			for p := range jobs {
-				id, uploaded, bytesDown, bytesUp, err := a.processItem(p, albumTitle, ac.URL, existingFiles, globalAssets)
+					id, uploaded, bytesDown, bytesUp, err := a.processItem(ctx, p, albumTitle, ac.URL, existingFiles, globalAssets)
 				results <- processResult{ID: id, WasUploaded: uploaded, Error: err, BytesDownloaded: bytesDown, BytesUploaded: bytesUp}
 			}
 		}()
 	}
 
-	// Feed jobs
+	// Feed jobs with context cancellation support
 	go func() {
 		for _, p := range album.Photos {
-			jobs <- p
+			select {
+			case <-ctx.Done():
+				break
+			case jobs <- p:
+			}
 		}
 		close(jobs)
 	}()
@@ -286,14 +328,13 @@ func (a *App) processAlbum(ac config.GooglePhotosConfig, albumCache []immich.Alb
 		// Update progress tracker
 		tracker.RecordItem(res.BytesDownloaded, res.BytesUploaded, wasAdded, wasSkipped, wasFailed)
 
-		// Flush new assets to album every ~10% of total items
-		if albumId != "" && len(newAssetIds) > lastFlushCount && (processed%flushInterval == 0 || processed == total) {
+		// Flush new assets to album periodically for incremental progress
+		if albumId != "" && len(newAssetIds) > lastFlushCount && processed%flushInterval == 0 {
 			batch := newAssetIds[lastFlushCount:]
+			lastFlushCount = len(newAssetIds)
 			logger.Info("Adding assets to album (incremental)", "count", len(batch), "progress", fmt.Sprintf("%d/%d", processed, total))
-			if err := a.Client.AddAssetsToAlbum(albumId, batch); err != nil {
+			if err := a.Client.AddAssetsToAlbum(ctx, albumId, batch); err != nil {
 				logger.Error("Error adding assets to album", "error", err)
-			} else {
-				lastFlushCount = len(newAssetIds)
 			}
 		}
 
@@ -306,12 +347,10 @@ func (a *App) processAlbum(ac config.GooglePhotosConfig, albumCache []immich.Alb
 	// Stop tracker and print final summary
 	tracker.Stop()
 
-	// Flush any remaining assets not yet added
-	if albumId != "" && len(newAssetIds) > lastFlushCount {
-		batch := newAssetIds[lastFlushCount:]
-		logger.Info("Adding remaining assets to album", "count", len(batch), "album", albumTitle)
-		err := a.Client.AddAssetsToAlbum(albumId, batch)
-		if err != nil {
+	// Final flush: add all assets to album (idempotent, catches any failures from incremental flushes)
+	if albumId != "" && len(newAssetIds) > 0 {
+		logger.Info("Finalizing album assets", "count", len(newAssetIds), "album", albumTitle)
+		if err := a.Client.AddAssetsToAlbum(ctx, albumId, newAssetIds); err != nil {
 			logger.Error("Error adding assets to album", "error", err)
 		}
 	}
@@ -320,7 +359,7 @@ func (a *App) processAlbum(ac config.GooglePhotosConfig, albumCache []immich.Alb
 	}
 }
 
-func (a *App) processItem(p googlephotos.Photo, albumTitle, albumURL string, existingFiles map[string]string, globalAssets map[string]string) (string, bool, int64, int64, error) {
+func (a *App) processItem(ctx context.Context, p googlephotos.Photo, albumTitle, albumURL string, existingFiles map[string]string, globalAssets map[string]string) (string, bool, int64, int64, error) {
 	safeId := strings.ReplaceAll(p.ID, "/", "_")
 	safeId = strings.ReplaceAll(safeId, ":", "_")
 	baseName := fmt.Sprintf("gp_%s", safeId)
@@ -343,17 +382,16 @@ func (a *App) processItem(p googlephotos.Photo, albumTitle, albumURL string, exi
 		return "", false, 0, 0, nil
 	}
 
-	// Download original media from Google Photos
+	// Download original media from Google Photos (returns buffered []byte)
 	a.Logger.Debug("Downloading item", "id", safeId)
-	r, size, ext, isVideo, err := googlephotos.DownloadMedia(a.GPClient, p.URL)
+	data, ext, isVideo, err := googlephotos.DownloadMedia(ctx, a.GPClient, p.URL)
 	if err != nil {
 		return "", false, 0, 0, fmt.Errorf("error downloading item: %w", err)
 	}
 
-	bytesDownloaded := size
+	bytesDownloaded := int64(len(data))
 
 	if isVideo && a.Cfg.SkipVideos {
-		r.Close()
 		a.Logger.Debug("Skipping video item", "id", p.ID)
 		return "", false, bytesDownloaded, 0, nil
 	}
@@ -373,15 +411,8 @@ func (a *App) processItem(p googlephotos.Photo, albumTitle, albumURL string, exi
 			"id", safeId, "url", p.URL, "is_video", isVideo)
 	}
 
-	// For images: buffer data and handle motion photos safely
+	// Handle motion photos for images
 	if !isVideo {
-		data, readErr := io.ReadAll(r)
-		r.Close()
-		if readErr != nil {
-			return "", false, bytesDownloaded, 0, fmt.Errorf("error reading item data: %w", readErr)
-		}
-
-		// ExtractMotionPhoto also strips MotionPhoto XMP flags to prevent Immich extraction errors
 		imageData, videoData, isMotion := googlephotos.ExtractMotionPhoto(data, a.Logger)
 
 		if isMotion {
@@ -394,9 +425,8 @@ func (a *App) processItem(p googlephotos.Photo, albumTitle, albumURL string, exi
 
 			// Upload the video part first
 			videoFilename := baseName + ".mp4"
-			videoId, _, videoErr := a.Client.UploadAssetStream(
-				io.NopCloser(bytes.NewReader(videoData)),
-				videoFilename, int64(len(videoData)), p.TakenAt, "")
+			videoId, _, videoErr := a.Client.UploadAsset(ctx,
+				videoData, videoFilename, p.TakenAt, "")
 			if videoErr != nil {
 				a.Logger.Warn("Failed to upload motion video, uploading image as static photo", "error", videoErr)
 			}
@@ -404,13 +434,12 @@ func (a *App) processItem(p googlephotos.Photo, albumTitle, albumURL string, exi
 			// Upload the image linked to the video
 			var uploadedId string
 			var isDup bool
-			imgReader := io.NopCloser(bytes.NewReader(imageData))
 			if videoId != "" {
-				uploadedId, isDup, err = a.Client.UploadAssetStreamWithLive(
-					imgReader, filename, int64(len(imageData)), p.TakenAt, description, videoId)
+				uploadedId, isDup, err = a.Client.UploadAssetWithLive(ctx,
+					imageData, filename, p.TakenAt, description, videoId)
 			} else {
-				uploadedId, isDup, err = a.Client.UploadAssetStream(
-					imgReader, filename, int64(len(imageData)), p.TakenAt, description)
+				uploadedId, isDup, err = a.Client.UploadAsset(ctx,
+					imageData, filename, p.TakenAt, description)
 			}
 			if err != nil {
 				return "", false, bytesDownloaded, 0, fmt.Errorf("error uploading %s: %w", filename, err)
@@ -428,13 +457,11 @@ func (a *App) processItem(p googlephotos.Photo, albumTitle, albumURL string, exi
 			return uploadedId, true, bytesDownloaded, bytesUploaded, nil
 		}
 
-		// Not a motion photo (or invalid extraction) — XMP flags already stripped by ExtractMotionPhoto
-		r = io.NopCloser(bytes.NewReader(imageData))
-		size = int64(len(imageData))
+		// Not a motion photo — XMP flags already stripped by ExtractMotionPhoto
+		data = imageData
 	}
 
-	uploadedId, isDup, err := a.Client.UploadAssetStream(r, filename, size, p.TakenAt, description)
-	r.Close()
+	uploadedId, isDup, err := a.Client.UploadAsset(ctx, data, filename, p.TakenAt, description)
 	if err != nil {
 		return "", false, bytesDownloaded, 0, fmt.Errorf("error uploading %s: %w", filename, err)
 	}
@@ -442,7 +469,7 @@ func (a *App) processItem(p googlephotos.Photo, albumTitle, albumURL string, exi
 		return "", false, bytesDownloaded, 0, fmt.Errorf("upload returned empty ID for %s", filename)
 	}
 
-	bytesUploaded := size
+	bytesUploaded := int64(len(data))
 
 	if isDup {
 		a.Logger.Debug("Asset deduplicated by Immich", "filename", filename, "id", uploadedId)

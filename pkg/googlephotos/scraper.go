@@ -2,6 +2,7 @@ package googlephotos
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -12,6 +13,17 @@ import (
 	"strconv"
 	"strings"
 	"time"
+)
+
+// Pre-compiled regexps for scraping performance
+var (
+	titleRe      = regexp.MustCompile(`<meta property="og:title" content="([^"]+)">`)
+	dateSuffixRe = regexp.MustCompile(`\s*·.*$`)
+	startRe      = regexp.MustCompile(`key:\s*'ds:1'.*?data:`)
+	wizSNlM0eRe  = regexp.MustCompile(`"SNlM0e":"([^"]+)"`)
+	wizFdrFJeRe  = regexp.MustCompile(`"FdrFJe":"([^"]+)"`)
+	wizCfb2hRe   = regexp.MustCompile(`"cfb2h":"([^"]+)"`)
+	wizEptZeRe   = regexp.MustCompile(`"eptZe":"([^"]+)"`)
 )
 
 type Album struct {
@@ -31,8 +43,8 @@ type Photo struct {
 
 // ScrapeAlbum parses a Google Photos shared album URL and returns the Album structure.
 // Handles pagination automatically for albums with more than ~300 items.
-func ScrapeAlbum(client *Client, albumURL string) (*Album, error) {
-	resp, err := client.Get(albumURL)
+func ScrapeAlbum(ctx context.Context, client *Client, albumURL string) (*Album, error) {
+	resp, err := client.Get(ctx, albumURL)
 	if err != nil {
 		return nil, err
 	}
@@ -56,7 +68,6 @@ func ScrapeAlbum(client *Client, albumURL string) (*Album, error) {
 
 	// Extract Title from OG:TITLE
 	title := "Google Photos Album"
-	titleRe := regexp.MustCompile(`<meta property="og:title" content="([^"]+)">`)
 	titleMatch := titleRe.FindStringSubmatch(htmlContent)
 	if len(titleMatch) > 1 {
 		title = titleMatch[1]
@@ -65,14 +76,12 @@ func ScrapeAlbum(client *Client, albumURL string) (*Album, error) {
 	// Clean Title
 	title = html.UnescapeString(title)
 	// Remove Date Range Suffix (e.g. " · Feb 6–7") and emojis
-	dateSuffixRe := regexp.MustCompile(`\s*·.*$`)
 	title = dateSuffixRe.ReplaceAllString(title, "")
 	title = strings.TrimSpace(title)
 	title = strings.TrimSuffix(title, " 📸")
 
 	// Find the start of the data
 	// Look for key: 'ds:1' followed by data:
-	startRe := regexp.MustCompile(`key:\s*'ds:1'.*?data:`)
 	loc := startRe.FindStringIndex(htmlContent)
 	if loc == nil {
 		return nil, fmt.Errorf("could not find album data (ds:1) in page")
@@ -210,7 +219,7 @@ func ScrapeAlbum(client *Client, albumURL string) (*Album, error) {
 			const maxPages = 500
 			for page := 0; page < maxPages && continueToken != ""; page++ {
 				client.logger.Debug("Fetching album page", "page", page+2, "total_items", len(photos))
-				nextPhotos, nextToken, fetchErr := fetchNextPage(client, mediaKey, authKey, continueToken, sourcePath, wiz)
+				nextPhotos, nextToken, fetchErr := fetchNextPage(ctx, client, mediaKey, authKey, continueToken, sourcePath, wiz)
 				if fetchErr != nil {
 					client.logger.Warn("Pagination stopped", "page", page+2, "error", fetchErr)
 					break
@@ -324,16 +333,16 @@ type wizTokens struct {
 // extractWizTokens parses WIZ_global_data tokens from page HTML for batchexecute requests
 func extractWizTokens(htmlContent string) wizTokens {
 	var tokens wizTokens
-	if m := regexp.MustCompile(`"SNlM0e":"([^"]+)"`).FindStringSubmatch(htmlContent); len(m) > 1 {
+	if m := wizSNlM0eRe.FindStringSubmatch(htmlContent); len(m) > 1 {
 		tokens.AT = m[1]
 	}
-	if m := regexp.MustCompile(`"FdrFJe":"([^"]+)"`).FindStringSubmatch(htmlContent); len(m) > 1 {
+	if m := wizFdrFJeRe.FindStringSubmatch(htmlContent); len(m) > 1 {
 		tokens.SID = m[1]
 	}
-	if m := regexp.MustCompile(`"cfb2h":"([^"]+)"`).FindStringSubmatch(htmlContent); len(m) > 1 {
+	if m := wizCfb2hRe.FindStringSubmatch(htmlContent); len(m) > 1 {
 		tokens.BL = m[1]
 	}
-	if m := regexp.MustCompile(`"eptZe":"([^"]+)"`).FindStringSubmatch(htmlContent); len(m) > 1 {
+	if m := wizEptZeRe.FindStringSubmatch(htmlContent); len(m) > 1 {
 		tokens.Path = m[1]
 	}
 	if tokens.Path == "" {
@@ -377,7 +386,7 @@ func extractAuthKeyFromURL(rawURL string) string {
 }
 
 // fetchNextPage calls Google's internal batchexecute API to get the next page of album items
-func fetchNextPage(client *Client, mediaKey, authKey, pageToken, sourcePath string, wiz wizTokens) ([]Photo, string, error) {
+func fetchNextPage(ctx context.Context, client *Client, mediaKey, authKey, pageToken, sourcePath string, wiz wizTokens) ([]Photo, string, error) {
 	// Build the inner request payload
 	innerData := []interface{}{mediaKey, pageToken, nil, authKey}
 	innerJSON, err := json.Marshal(innerData)
@@ -411,7 +420,7 @@ func fetchNextPage(client *Client, mediaKey, authKey, pageToken, sourcePath stri
 		url.QueryEscape(wiz.BL),
 	)
 
-	resp, err := client.Post(batchURL, "application/x-www-form-urlencoded;charset=UTF-8", formBody.Encode())
+	resp, err := client.Post(ctx, batchURL, "application/x-www-form-urlencoded;charset=UTF-8", formBody.Encode())
 	if err != nil {
 		return nil, "", fmt.Errorf("batchexecute request failed: %w", err)
 	}
@@ -637,59 +646,44 @@ func extensionFromContentType(contentType string) string {
 }
 
 // DownloadMedia downloads original media from Google Photos.
-// Uses =d for original quality images (preserves motion photo data for Immich), =dv for videos.
-// Response is buffered to guarantee accurate Content-Length for the upload.
-// Returns: body, size, extension (e.g. ".jpg"), isVideo, error
-func DownloadMedia(client *Client, baseUrl string) (io.ReadCloser, int64, string, bool, error) {
-	// HEAD probe to detect content type without downloading body
-	probeResp, err := client.Head(baseUrl + "=d")
+// Fetches with =d first and checks Content-Type headers to detect videos (avoiding a separate HEAD probe).
+// Videos are re-fetched with =dv for proper download.
+// Returns: data, extension (e.g. ".jpg"), isVideo, error
+func DownloadMedia(ctx context.Context, client *Client, baseUrl string) ([]byte, string, bool, error) {
+	// Fetch with =d (original quality, preserves motion photo data for images)
+	resp, err := client.Get(ctx, baseUrl+"=d")
 	if err != nil {
-		return nil, 0, "", false, err
-	}
-	probeResp.Body.Close()
-
-	probeCt := probeResp.Header.Get("Content-Type")
-	isVideo := strings.HasPrefix(strings.ToLower(probeCt), "video/")
-
-	// Pure video: download with =dv
-	if isVideo {
-		resp, err := client.Get(baseUrl + "=dv")
-		if err != nil {
-			return nil, 0, "", false, err
-		}
-		if resp.StatusCode != 200 {
-			resp.Body.Close()
-			return nil, 0, "", false, fmt.Errorf("failed to download video: %d", resp.StatusCode)
-		}
-		// Buffer video for accurate size
-		data, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			return nil, 0, "", false, fmt.Errorf("failed to read video data: %w", err)
-		}
-		ct := resp.Header.Get("Content-Type")
-		ext := extensionFromContentType(ct)
-		return io.NopCloser(bytes.NewReader(data)), int64(len(data)), ext, true, nil
+		return nil, "", false, fmt.Errorf("download failed: %w", err)
 	}
 
-	// Image: download original with =d (motion photos are preserved as-is for Immich)
-	resp, err := client.Get(baseUrl + "=d")
-	if err != nil {
-		return nil, 0, "", false, err
-	}
 	if resp.StatusCode != 200 {
 		resp.Body.Close()
-		return nil, 0, "", false, fmt.Errorf("failed to download image: %d", resp.StatusCode)
-	}
-
-	// Buffer to guarantee accurate size (HTTP Content-Length can be -1 for chunked responses)
-	data, err := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if err != nil {
-		return nil, 0, "", false, fmt.Errorf("failed to read image data: %w", err)
+		return nil, "", false, fmt.Errorf("download returned status %d", resp.StatusCode)
 	}
 
 	ct := resp.Header.Get("Content-Type")
+	isVideo := strings.HasPrefix(strings.ToLower(ct), "video/")
+
+	// Videos need =dv suffix for proper download
+	if isVideo {
+		resp.Body.Close()
+		resp, err = client.Get(ctx, baseUrl+"=dv")
+		if err != nil {
+			return nil, "", false, fmt.Errorf("video download failed: %w", err)
+		}
+		if resp.StatusCode != 200 {
+			resp.Body.Close()
+			return nil, "", false, fmt.Errorf("video download returned status %d", resp.StatusCode)
+		}
+		ct = resp.Header.Get("Content-Type")
+	}
+	defer resp.Body.Close()
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", false, fmt.Errorf("failed to read response body: %w", err)
+	}
+
 	ext := extensionFromContentType(ct)
-	return io.NopCloser(bytes.NewReader(data)), int64(len(data)), ext, false, nil
+	return data, ext, isVideo, nil
 }

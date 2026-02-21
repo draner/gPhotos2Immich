@@ -1,6 +1,8 @@
 package googlephotos
 
 import (
+	"context"
+	"fmt"
 	"log/slog"
 	"math/rand"
 	"net/http"
@@ -23,13 +25,26 @@ type Client struct {
 	logger *slog.Logger
 }
 
-func NewClient(logger *slog.Logger) *Client {
-	jar, _ := cookiejar.New(nil)
+// NewClient creates a Google Photos HTTP client with connection pooling tuned to the given concurrency level
+func NewClient(logger *slog.Logger, maxConnsPerHost int) *Client {
+	if maxConnsPerHost < 10 {
+		maxConnsPerHost = 10
+	}
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		logger.Warn("Failed to create cookie jar, continuing without cookies", "error", err)
+	}
 	return &Client{
 		client: &http.Client{
 			Jar: jar,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				return nil
+			},
+			Transport: &http.Transport{
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: maxConnsPerHost,
+				IdleConnTimeout:     90 * time.Second,
+				ForceAttemptHTTP2:   true,
 			},
 			Timeout: 120 * time.Second,
 		},
@@ -37,9 +52,10 @@ func NewClient(logger *slog.Logger) *Client {
 	}
 }
 
-func (c *Client) Get(targetURL string) (*http.Response, error) {
-	return c.doWithRetry(func() (*http.Request, error) {
-		req, err := http.NewRequest("GET", targetURL, nil)
+// Get performs a GET request with retry logic
+func (c *Client) Get(ctx context.Context, targetURL string) (*http.Response, error) {
+	return c.doWithRetry(ctx, func(ctx context.Context) (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, "GET", targetURL, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -48,20 +64,22 @@ func (c *Client) Get(targetURL string) (*http.Response, error) {
 	})
 }
 
-// Head performs a lightweight HEAD request without jitter (used for content-type probing)
-func (c *Client) Head(targetURL string) (*http.Response, error) {
-	req, err := http.NewRequest("HEAD", targetURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", userAgent)
-	return c.client.Do(req)
+// Head performs a HEAD request with retry logic
+func (c *Client) Head(ctx context.Context, targetURL string) (*http.Response, error) {
+	return c.doWithRetry(ctx, func(ctx context.Context) (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, "HEAD", targetURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("User-Agent", userAgent)
+		return req, nil
+	})
 }
 
 // Post performs a POST request with retry logic and cookie/session support
-func (c *Client) Post(targetURL string, contentType string, body string) (*http.Response, error) {
-	return c.doWithRetry(func() (*http.Request, error) {
-		req, err := http.NewRequest("POST", targetURL, strings.NewReader(body))
+func (c *Client) Post(ctx context.Context, targetURL string, contentType string, body string) (*http.Response, error) {
+	return c.doWithRetry(ctx, func(ctx context.Context) (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, "POST", targetURL, strings.NewReader(body))
 		if err != nil {
 			return nil, err
 		}
@@ -71,24 +89,34 @@ func (c *Client) Post(targetURL string, contentType string, body string) (*http.
 	})
 }
 
-// doWithRetry executes a request with jitter, rate-limit retry and exponential backoff
-func (c *Client) doWithRetry(makeReq func() (*http.Request, error)) (*http.Response, error) {
-	jitter := time.Duration(minJitter+rand.Intn(jitterRange)) * time.Millisecond
-	time.Sleep(jitter)
-
-	var resp *http.Response
+// doWithRetry executes a request with retries on network errors/429/5xx and exponential backoff.
+// Jitter is only applied between retries, not before the first attempt.
+func (c *Client) doWithRetry(ctx context.Context, makeReq func(context.Context) (*http.Request, error)) (*http.Response, error) {
+	var lastErr error
 	for i := 0; i < maxRetries; i++ {
-		req, err := makeReq()
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		req, err := makeReq(ctx)
 		if err != nil {
 			return nil, err
 		}
 
-		resp, err = c.client.Do(req)
+		resp, err := c.client.Do(req)
 		if err != nil {
-			return nil, err
+			lastErr = err
+			sleepTime := baseBackoff * time.Duration(i+1)
+			c.logger.Warn("Network error, retrying", "error", err, "sleep", sleepTime, "attempt", i+1)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(sleepTime):
+			}
+			continue
 		}
 
-		// Success or client error (4xx except 429) — return immediately
+		// Success or non-retryable client error (4xx except 429)
 		if resp.StatusCode < 429 || (resp.StatusCode > 429 && resp.StatusCode < 500) {
 			return resp, nil
 		}
@@ -103,9 +131,17 @@ func (c *Client) doWithRetry(makeReq func() (*http.Request, error)) (*http.Respo
 				}
 			}
 		}
+		lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
 		c.logger.Warn("Retryable HTTP error, retrying", "status", resp.StatusCode, "sleep", sleepTime, "attempt", i+1)
-		time.Sleep(sleepTime)
+
+		// Add jitter only between retries
+		jitter := time.Duration(minJitter+rand.Intn(jitterRange)) * time.Millisecond
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(sleepTime + jitter):
+		}
 	}
 
-	return resp, nil
+	return nil, fmt.Errorf("request failed after %d retries: %w", maxRetries, lastErr)
 }
