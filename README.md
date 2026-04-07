@@ -32,7 +32,8 @@ Sync photos from Google Photos shared albums to your [Immich](https://immich.app
 
 <br/>
 
-> [!IMPORTANT] The built-in Web configuration UI is not password-protected. Do **NOT** expose the port to the public internet or untrusted networks!
+> [!IMPORTANT]
+> The built-in Web configuration UI is not password-protected. Do **NOT** expose the port to the public internet or untrusted networks!
 
 > **Heads Up!** If you prefer not to use a Web UI, you can fully disable it by setting `DISABLE_WEBUI=true` and configuring via `config.json`. See the [Configuration Document](CONFIGURATION.md) for details on formatting and settings.
 
@@ -52,7 +53,8 @@ To sync photos, generate an Immich API key with the following permissions (or ju
 - **Smart Syncing:** We pull down the full images and videos (no compressed thumbnails), extract the correct "taken" dates, and smoothly avoid Google's rate limits.
 - **Speed & Deduping:** Concurrent workers speed through downloads, while a persistent local cache skips over photos that Immich already has, saving you bandwidth.
 
-> [!NOTE] Motion/Live photos are imported as still images. The embedded video component is stripped so Immich handles them without errors.
+> [!NOTE]
+> Motion/Live photos are imported as still images. The embedded video component is stripped so Immich handles them without errors.
 
 ---
 
