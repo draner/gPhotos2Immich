@@ -2,8 +2,11 @@ services:
   gphotos2immich:
     build: .
     container_name: gphotos2immich
+    network_mode: "host"
     environment:
       - TZ=UTC
+      - PORT=8080 # Port for the Web UI
+      - DISABLE_WEBUI=false # Set to true to fully disable the Web UI
       # - IMMICH_API_KEY=your-key # If not using config.json
       # - IMMICH_API_URL=http://immich-server/api # If not using config.json
     volumes:

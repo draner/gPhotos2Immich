@@ -6,9 +6,7 @@ Sync photos from Google Photos shared albums to your [Immich](https://immich.app
 
 ## Quick Start
 
-1. Copy `config.example.json` to `config.json` and fill in your Immich API details and Google Photos shared album links.
-
-2. Run with Docker Compose:
+1. Run with Docker Compose:
 
    ```yaml
    # compose.yml
@@ -16,9 +14,13 @@ Sync photos from Google Photos shared albums to your [Immich](https://immich.app
      gphotos2immich:
        image: ghcr.io/warreth/gphotos2immich:latest
        container_name: gphotos2immich
+       network_mode: "host" # Fixes DNS resolution and natively exposes port 8080 for the Web UI
        restart: unless-stopped
+       environment:
+         - PORT=8080 # Port for the Web UI
+         - DISABLE_WEBUI=false # Set to true to fully disable the Web UI
        volumes:
-         - ./config.json:/app/config.json
+         - ./config.json:/app/config.json # Optional, will be created by Web UI if omitted
          - ./data:/app/data # Persistent dedup cache (survives container restarts)
    ```
 
@@ -26,79 +28,31 @@ Sync photos from Google Photos shared albums to your [Immich](https://immich.app
    docker compose up -d
    ```
 
-> You can also configure via environment variables (`IMMICH_API_KEY`, `IMMICH_API_URL`) instead of mounting a config file.
+2. Open **[http://localhost:8080](http://localhost:8080)** in your browser to configure your Immich API details and Google Photos shared album links via the Web UI! The app will automatically hot-reload when you save changes.
+
+<br/>
+
+> [!IMPORTANT] The built-in Web configuration UI is not password-protected. Do **NOT** expose the port to the public internet or untrusted networks!
+
+> **Heads Up!** If you prefer not to use a Web UI, you can fully disable it by setting `DISABLE_WEBUI=true` and configuring via `config.json`. See the [Configuration Document](CONFIGURATION.md) for details on formatting and settings.
 
 ---
 
-## Configuration
+## API Key Permissions
 
-### API Permissions
-
-Your Immich API key needs these permissions (or use "All"):
-
+To sync photos, generate an Immich API key with the following permissions (or just select "All"):
 `asset.read` · `asset.upload` · `album.create` · `album.read` · `album.update` · `albumAsset.create` · `user.read`
-
-### Example `config.json`
-
-```json
-{
-  "apiKey": "YOUR_IMMICH_API_KEY",
-  "apiURL": "http://your-immich-ip:2283/api",
-  "debug": false,
-  "workers": 4,
-  "albumWorkers": 3,
-  "strictMetadata": false,
-  "skipVideos": false,
-  "googlePhotos": [
-    {
-      "url": "https://photos.app.goo.gl/YourAlbumLink1",
-      "albumName": "Vacation 2023",
-      "syncInterval": "12h"
-    },
-    {
-      "url": "https://photos.app.goo.gl/ExistingAlbumLink",
-      "immichAlbumId": "existing-album-uuid",
-      "syncInterval": "1h"
-    }
-  ]
-}
-```
-
-### Options
-
-| Key | Type | Default | Description |
-| --- | --- | --- | --- |
-| `apiKey` | string | — | Immich API key (required). |
-| `apiURL` | string | — | Immich API URL, e.g. `http://localhost:2283/api` (required). |
-| `debug` | bool | `false` | Enable verbose debug logging. When disabled, displays clean progress bars with speed and ETA. |
-| `workers` | int | `1` | Number of concurrent download/upload workers **per album**. Controls how many photos within a single album are downloaded and uploaded in parallel. Higher values speed up large albums but use more bandwidth and memory. |
-| `albumWorkers` | int | `1` | Number of albums processed **concurrently**. Controls how many albums are synced at the same time. Useful when you have many albums configured and want to process several in parallel. |
-| `strictMetadata` | bool | `false` | Skip items with missing/invalid dates instead of uploading with current date. Skipped URLs are logged for manual review. |
-| `skipVideos` | bool | `false` | Skip all video items entirely. Useful if you only want photos. |
-
-### Album Options
-
-| Key | Type | Default | Description |
-| --- | --- | --- | --- |
-| `googlePhotos[].url` | string | — | Google Photos shared album link (required). |
-| `googlePhotos[].albumName` | string | auto-detected | Override the album name in Immich. If omitted, uses the album title from Google Photos. |
-| `googlePhotos[].syncInterval` | string | `24h` | How often to re-check this album (e.g. `12h`, `60m`, `1h30m`). |
-| `googlePhotos[].immichAlbumId` | string | — | Link to an existing Immich album by UUID instead of creating a new one. |
 
 ---
 
 ## Features
 
-- **No Google API key required.** Scrapes directly from shared album links.
-- **Video support.** Downloads full videos, not just thumbnails. Disable with `skipVideos`.
-- **Concurrent workers.** Parallel download/upload per album (`workers`) and parallel album processing (`albumWorkers`).
-- **Live progress.** Progress bars with transfer speed and ETA; verbose structured logs in debug mode.
-- **Smart date detection.** Extracts the original "taken" date from metadata.
-- **Strict metadata mode.** Optionally skip items with missing dates instead of falling back to the current date.
-- **Rate limit protection.** Jitter and exponential backoff to avoid Google Photos throttling.
-- **Duplicate detection.** Pre-fetches existing album assets for O(1) dedup. Persistent local cache (`./data/sync-state.json`) survives container restarts. Respects Immich trash.
+- **No Google API Keys:** We scrape directly from shared album URLs, so there's no complex Google Cloud setup required!
+- **Web UI & Hot Reloading:** Manage your albums from a sleek web interface on port 8080. Check live logs and tweak settings; everything applies instantly without restarting the container.
+- **Smart Syncing:** We pull down the full images and videos (no compressed thumbnails), extract the correct "taken" dates, and smoothly avoid Google's rate limits.
+- **Speed & Deduping:** Concurrent workers speed through downloads, while a persistent local cache skips over photos that Immich already has, saving you bandwidth.
 
-> **Note:** Motion/Live photos are imported as still images. The embedded video component is stripped so Immich handles them without errors.
+> [!NOTE] Motion/Live photos are imported as still images. The embedded video component is stripped so Immich handles them without errors.
 
 ---
 
