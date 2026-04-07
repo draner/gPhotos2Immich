@@ -2,6 +2,7 @@ package web
 
 import (
 	"bytes"
+	"context"
 	_ "embed"
 	"encoding/json"
 	"fmt"
@@ -9,8 +10,11 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"time"
 
 	"warreth.dev/gphotos2immich/pkg/config"
+	"warreth.dev/gphotos2immich/pkg/immich"
+	"warreth.dev/gphotos2immich/pkg/progress"
 )
 
 const maxLogSize = 100 * 1024 // 100KB max logs stored
@@ -64,6 +68,7 @@ func (s *Server) Start(port int) error {
 	mux.HandleFunc("/", s.handleIndex)
 	mux.HandleFunc("/api/config", s.handleConfig)
 	mux.HandleFunc("/api/logs", s.handleLogs)
+	mux.HandleFunc("/api/status", s.handleStatus)
 
 	addr := fmt.Sprintf(":%d", port)
 	srv := &http.Server{
@@ -91,6 +96,59 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/plain")
 	io.WriteString(w, GlobalLogBuffer.String())
+}
+
+var cachedImmichUser string
+var cachedImmichUserMu sync.Mutex
+
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+
+	// Get current target album progress
+	album, processed, total := progress.ActiveStatus()
+
+	// Optionally resolve user if not known (don't block long though)
+	userName := ""
+	cachedImmichUserMu.Lock()
+	userName = cachedImmichUser
+	cachedImmichUserMu.Unlock()
+
+	if userName == "" {
+		// Read config to initialize client
+		cfgBytes, err := os.ReadFile(s.configPath)
+		if err == nil {
+			var configData struct {
+				ApiURL string `json:"apiURL"`
+				ApiKey string `json:"apiKey"`
+			}
+			if err := json.Unmarshal(cfgBytes, &configData); err == nil && configData.ApiURL != "" && configData.ApiKey != "" {
+				go func() {
+					client := immich.NewClient(configData.ApiURL, configData.ApiKey, 1)
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					if _, name, err := client.GetUser(ctx); err == nil && name != "" {
+						cachedImmichUserMu.Lock()
+						cachedImmichUser = name
+						cachedImmichUserMu.Unlock()
+					}
+				}()
+			}
+		}
+	}
+
+	resp := map[string]interface{}{
+		"immichUser": userName,
+		"album":      album,
+		"processed":  processed,
+		"total":      total,
+	}
+
+	json.NewEncoder(w).Encode(resp)
 }
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {

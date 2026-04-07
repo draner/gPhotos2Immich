@@ -107,6 +107,28 @@
         .tab.active { border-bottom-color: var(--primary-color); color: var(--primary-color); }
         .tab-content { display: none; }
         .tab-content.active { display: block; }
+        
+        .albums-section {
+            display: flex;
+            gap: 20px;
+            align-items: flex-start;
+        }
+        .albums-table-container {
+            flex: 2;
+        }
+        .status-container {
+            flex: 1;
+            padding: 15px;
+            background: #f8f9fa;
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            margin-top: 15px;
+        }
+        .status-container h3 { margin-top: 0; font-size: 16px; }
+        .progress-bar-bg { width: 100%; background-color: #ddd; border-radius: 4px; height: 20px; overflow: hidden; margin-top: 10px; }
+        .progress-bar-fill { height: 100%; background-color: var(--success-color); width: 0%; transition: width 0.3s; }
+        .status-text { font-size: 14px; margin-top: 5px; }
+
     </style>
 </head>
 <body>
@@ -129,20 +151,34 @@
 
                 <!-- Albums -->
                 <h2>Google Photos Albums</h2>
-                <table id="albumsTable">
-                    <thead>
-                        <tr>
-                            <th>URL</th>
-                            <th>Album Name</th>
-                            <th>Sync Interval</th>
-                            <th>Action</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <!-- Populated by JS -->
-                    </tbody>
-                </table>
-                <button type="button" class="btn" onclick="addAlbumRow()">+ Add Album</button>
+                <div class="albums-section">
+                    <div class="albums-table-container">
+                        <table id="albumsTable">
+                            <thead>
+                                <tr>
+                                    <th>URL</th>
+                                    <th>Album Name</th>
+                                    <th>Sync Interval</th>
+                                    <th>Action</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <!-- Populated by JS -->
+                            </tbody>
+                        </table>
+                        <button type="button" class="btn" onclick="addAlbumRow()">+ Add Album</button>
+                    </div>
+
+                    <div class="status-container" id="syncStatusPanel">
+                        <h3>Sync Status</h3>
+                        <div class="status-text" id="statusImmichUser">User: Loading...</div>
+                        <div class="status-text" id="statusAlbum">Current Album: None</div>
+                        <div class="progress-bar-bg">
+                            <div class="progress-bar-fill" id="statusProgressBar"></div>
+                        </div>
+                        <div class="status-text" id="statusItems">Items: 0 / 0</div>
+                    </div>
+                </div>
             </div>
 
             <div id="tab-advanced" class="tab-content">
@@ -240,11 +276,41 @@
             }
         }
 
+        async function pollStatus() {
+            try {
+                const res = await fetch('/api/status');
+                if (!res.ok) return;
+                const data = await res.json();
+                
+                document.getElementById('statusImmichUser').textContent = data.immichUser ? `User: ${data.immichUser}` : 'User: Unknown';
+                
+                if (data.album) {
+                    document.getElementById('statusAlbum').textContent = `Current Album: ${data.album}`;
+                    document.getElementById('statusItems').textContent = `Items: ${data.processed} / ${data.total}`;
+                    let percent = 0;
+                    if (data.total > 0) {
+                        percent = (data.processed / data.total) * 100;
+                    }
+                    document.getElementById('statusProgressBar').style.width = `${percent}%`;
+                } else {
+                    document.getElementById('statusAlbum').textContent = 'Current Album: None';
+                    document.getElementById('statusItems').textContent = 'Items: 0 / 0';
+                    document.getElementById('statusProgressBar').style.width = '0%';
+                }
+            } catch (err) {
+                // Ignore silent errors during polling
+            }
+        }
+
         setInterval(() => {
             if (document.getElementById('tab-advanced').classList.contains('active')) {
                 refreshLogs();
             }
+            pollStatus();
         }, 5000);
+        
+        // Initial poll right away
+        pollStatus();
 
         async function loadConfig() {
             try {

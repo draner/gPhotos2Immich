@@ -36,6 +36,21 @@ type Tracker struct {
 	once            sync.Once
 }
 
+var (
+	GlobalTrackerMu sync.RWMutex
+	GlobalTracker   *Tracker
+)
+
+// ActiveStatus returns the current sync status
+func ActiveStatus() (album string, processed, total int) {
+	GlobalTrackerMu.RLock()
+	defer GlobalTrackerMu.RUnlock()
+	if GlobalTracker == nil {
+		return "", 0, 0
+	}
+	return GlobalTracker.albumName, int(GlobalTracker.processedItems.Load()), GlobalTracker.totalItems
+}
+
 // detectTTY checks if stdout is a terminal (false in Docker logs)
 func detectTTY() bool {
 	stat, err := os.Stdout.Stat()
@@ -47,7 +62,7 @@ func detectTTY() bool {
 
 // New creates a new progress tracker for an album
 func New(albumName string, totalItems int, debug bool) *Tracker {
-	return &Tracker{
+	t := &Tracker{
 		albumName:      albumName,
 		totalItems:     totalItems,
 		startTime:      time.Now(),
@@ -56,6 +71,10 @@ func New(albumName string, totalItems int, debug bool) *Tracker {
 		lastLogPercent: -1,
 		done:           make(chan struct{}),
 	}
+	GlobalTrackerMu.Lock()
+	GlobalTracker = t
+	GlobalTrackerMu.Unlock()
+	return t
 }
 
 // RecordItem records a processed item with its transfer sizes
@@ -108,6 +127,11 @@ func (t *Tracker) Stop() {
 		if !t.debug {
 			t.printFinal()
 		}
+		GlobalTrackerMu.Lock()
+		if GlobalTracker == t {
+			GlobalTracker = nil
+		}
+		GlobalTrackerMu.Unlock()
 	})
 }
 
