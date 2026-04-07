@@ -24,13 +24,60 @@
             display: flex;
             justify-content: center;
         }
-        .container {
+        .container, .wizard-container {
             max-width: 800px;
             width: 100%;
             background: var(--card-bg);
             padding: 30px;
             border-radius: 8px;
             box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        .wizard-container {
+            display: none;
+            text-align: center;
+        }
+        .wizard-step {
+            display: none;
+        }
+        .wizard-step.active {
+            display: block;
+            animation: fadeIn 0.3s ease-in-out;
+        }
+        .wizard-step-title {
+            font-size: 24px;
+            margin-bottom: 20px;
+            color: var(--primary-color);
+        }
+        .wizard-buttons {
+            margin-top: 30px;
+            display: flex;
+            justify-content: space-between;
+        }
+        .wizard-buttons.right {
+            justify-content: flex-end;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .setup-field {
+            text-align: left;
+            margin-bottom: 20px;
+        }
+        .setup-field label {
+            display: block;
+            margin-bottom: 8px;
+            margin-top: 0;
+        }
+        .setup-field input {
+            width: 100%;
+        }
+        .wizard-album-row {
+            display: flex; gap: 10px; margin-bottom: 10px; text-align: left;
+        }
+        .wizard-album-row input { flex: 1; }
+        .wizard-hint {
+            font-size: 13px; color: #666; margin-top: 5px; text-align: left;
         }
         h1 { margin-top: 0; font-size: 24px; border-bottom: 2px solid var(--border-color); padding-bottom: 10px; }
         h2 { font-size: 20px; margin-top: 30px; }
@@ -63,7 +110,7 @@
     </style>
 </head>
 <body>
-    <div class="container">
+    <div id="mainUI" class="container">
         <h1>gPhotos2Immich Configuration</h1>
         
         <div class="tabs">
@@ -116,8 +163,56 @@
                 <button type="button" class="btn btn-success" onclick="saveConfig()">Save Configuration</button>
             </div>
         </form>
+
+        <div style="margin-top: 20px; text-align: center; font-size: 14px; color: #666;">
+            If you find this project useful, please consider <a href="https://github.com/sponsors/warreth" target="_blank" rel="noopener noreferrer" style="color: var(--primary-color); text-decoration: none; font-weight: bold;">sponsoring me on GitHub</a> to support its development! ❤️
+        </div>
     </div>
     
+    <div id="wizardUI" class="wizard-container">
+        <div id="wizard-1" class="wizard-step active">
+            <h2 class="wizard-step-title">Welcome to gPhotos2Immich</h2>
+            <p>It looks like this is your first time starting this container.</p>
+            <p>This quick setup wizard will help you configure your Immich connection and add your first Google Photos album to sync.</p>
+            <div class="wizard-buttons right">
+                <button type="button" class="btn btn-success" onclick="goWizardStep(2)">Get Started &rarr;</button>
+            </div>
+        </div>
+
+        <div id="wizard-2" class="wizard-step">
+            <h2 class="wizard-step-title">Step 1: Immich Settings</h2>
+            <div class="setup-field">
+                <label for="wizApiURL">Immich API URL</label>
+                <input type="text" id="wizApiURL" placeholder="https://immich.example.com/api">
+                <div class="wizard-hint">The URL to your Immich instance, including /api at the end.</div>
+            </div>
+            <div class="setup-field">
+                <label for="wizApiKey">Immich API Key</label>
+                <input type="password" id="wizApiKey" placeholder="Your Immich API Key">
+                <div class="wizard-hint">Generate an API key in the Immich Account Settings.</div>
+            </div>
+            <div class="wizard-buttons">
+                <button type="button" class="btn" onclick="goWizardStep(1)">&larr; Back</button>
+                <button type="button" class="btn btn-success" onclick="goWizardStep(3)">Next: Add Album &rarr;</button>
+            </div>
+        </div>
+
+        <div id="wizard-3" class="wizard-step">
+            <h2 class="wizard-step-title">Step 2: Add Your First Album</h2>
+            <p style="text-align: left;">Enter the shared link to your Google Photos album. You can always add more later.</p>
+            <div class="setup-field">
+                <div class="wizard-album-row">
+                    <input type="text" id="wizAlbumUrl" placeholder="https://photos.app.goo.gl/..." style="flex: 2;">
+                    <input type="text" id="wizAlbumName" placeholder="Album Name (Optional)">
+                </div>
+            </div>
+            <div class="wizard-buttons">
+                <button type="button" class="btn" onclick="goWizardStep(2)">&larr; Back</button>
+                <button type="button" class="btn btn-success" onclick="finishWizard()">Finish Setup &check;</button>
+            </div>
+        </div>
+    </div>
+
     <div id="toast" class="toast">Saved successfully!</div>
 
     <script>
@@ -167,10 +262,54 @@
                 if (config.googlePhotos && config.googlePhotos.length > 0) {
                     config.googlePhotos.forEach(gp => addAlbumRow(gp));
                 }
+
+                // Show wizard if unconfigured
+                if (!config.apiURL || !config.apiKey) {
+                    document.getElementById('mainUI').style.display = 'none';
+                    document.getElementById('wizardUI').style.display = 'block';
+                    goWizardStep(1);
+                } else {
+                    document.getElementById('mainUI').style.display = 'block';
+                    document.getElementById('wizardUI').style.display = 'none';
+                }
             } catch (err) {
                 console.error(err);
                 alert('Error loading configuration');
             }
+        }
+
+        function goWizardStep(stepNumber) {
+            document.querySelectorAll('.wizard-step').forEach(el => el.classList.remove('active'));
+            document.getElementById('wizard-' + stepNumber).classList.add('active');
+        }
+
+        function finishWizard() {
+            const apiUrl = document.getElementById('wizApiURL').value;
+            const apiKey = document.getElementById('wizApiKey').value;
+            if (!apiUrl || !apiKey) {
+                alert("Please provide the Immich API URL and Key in Step 1.");
+                goWizardStep(2);
+                return;
+            }
+
+            document.getElementById('apiURL').value = apiUrl;
+            document.getElementById('apiKey').value = apiKey;
+            
+            const wpUrl = document.getElementById('wizAlbumUrl').value;
+            const wpName = document.getElementById('wizAlbumName').value;
+            
+            // Default configuration empty
+            document.querySelector('#albumsTable tbody').innerHTML = '';
+            
+            if (wpUrl) {
+                addAlbumRow({ url: wpUrl, albumName: wpName, syncInterval: '12h' });
+            }
+
+            document.getElementById('wizardUI').style.display = 'none';
+            document.getElementById('mainUI').style.display = 'block';
+            
+            // Auto save on finish
+            saveConfig();
         }
 
         function addAlbumRow(gp = {url: '', albumName: '', syncInterval: '120h'}) {
