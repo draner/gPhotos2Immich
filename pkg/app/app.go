@@ -215,6 +215,9 @@ func (a *App) prefetchAlbumAssets(ctx context.Context, albumId string, logger *s
 		return existingFiles
 	}
 	for _, asset := range albumDetails.Assets {
+		if util.IsVideoFilename(asset.OriginalFileName) {
+			continue
+		}
 		name := util.StripExtension(asset.OriginalFileName)
 		existingFiles[name] = asset.Id
 	}
@@ -446,8 +449,8 @@ func (a *App) processItem(ctx context.Context, p googlephotos.Photo, albumTitle,
 
 			// Upload the video part first
 			videoFilename := baseName + ".mp4"
-			videoId, videoDup, videoErr := a.Client.UploadAsset(ctx,
-				videoData, videoFilename, p.TakenAt, "")
+			videoId, videoDup, videoErr := a.Client.UploadAssetWithVisibility(ctx,
+				videoData, videoFilename, p.TakenAt, "", "hidden")
 			if videoErr != nil {
 				a.Logger.Warn("Failed to upload motion video, uploading image as static photo", "error", videoErr)
 			} else if videoDup {

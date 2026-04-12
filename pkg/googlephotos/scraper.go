@@ -679,34 +679,10 @@ func isVideoMagicBytes(data []byte) bool {
 }
 
 // DownloadMedia downloads original media from Google Photos.
-// Probes =dv with HEAD to detect videos before downloading.
+// It always tries =d first so motion photos are fetched as their JPEG container
+// (e.g. *.MP.jpg) instead of the short motion-video stream from =dv.
 func DownloadMedia(ctx context.Context, client *Client, baseUrl string) ([]byte, string, bool, error) {
-	// HEAD probe on =dv to detect video items
-	headResp, headErr := client.Head(ctx, baseUrl+"=dv")
-	if headErr == nil {
-		headResp.Body.Close()
-		dvCt := strings.ToLower(headResp.Header.Get("Content-Type"))
-		if headResp.StatusCode == 200 && strings.HasPrefix(dvCt, "video/") {
-			// Confirmed video, download with =dv
-			resp, err := client.Get(ctx, baseUrl+"=dv")
-			if err != nil {
-				return nil, "", false, fmt.Errorf("video download failed: %w", err)
-			}
-			defer resp.Body.Close()
-			if resp.StatusCode != 200 {
-				return nil, "", false, fmt.Errorf("video download returned status %d", resp.StatusCode)
-			}
-			ct := resp.Header.Get("Content-Type")
-			data, err := io.ReadAll(resp.Body)
-			if err != nil {
-				return nil, "", false, fmt.Errorf("failed to read video response body: %w", err)
-			}
-			ext := extensionFromContentType(ct)
-			return data, ext, true, nil
-		}
-	}
-
-	// Not a video, download as image with =d
+	// Always fetch =d first. For motion photos this is the image container file.
 	resp, err := client.Get(ctx, baseUrl+"=d")
 	if err != nil {
 		return nil, "", false, fmt.Errorf("download failed: %w", err)
@@ -723,10 +699,9 @@ func DownloadMedia(ctx context.Context, client *Client, baseUrl string) ([]byte,
 		return nil, "", false, fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	// Safety net: detect videos that slipped through the HEAD probe
+	// If =d is actually a video item, prefer =dv for the original video stream.
 	isVideo := strings.HasPrefix(strings.ToLower(ct), "video/") || isVideoMagicBytes(data)
 	if isVideo {
-		// Re-download with =dv for proper video data
 		resp2, err := client.Get(ctx, baseUrl+"=dv")
 		if err != nil {
 			return nil, "", false, fmt.Errorf("video re-download failed: %w", err)
