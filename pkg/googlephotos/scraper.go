@@ -766,9 +766,27 @@ func DownloadMotionVideoSidecar(ctx context.Context, client *Client, baseUrl str
 	}
 
 	ct := resp.Header.Get("Content-Type")
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, "", fmt.Errorf("failed to read sidecar body: %w", err)
+
+	var data []byte
+	if !strings.HasPrefix(strings.ToLower(ct), "video/") {
+		// If it's not explicitly marked as video, sniff a small chunk before downloading fully
+		buf := make([]byte, 512)
+		n, _ := io.ReadFull(resp.Body, buf)
+		if n > 0 && !isVideoMagicBytes(buf[:n]) {
+			return nil, "", fmt.Errorf("sidecar is not a video payload (type: %s)", ct)
+		}
+		
+		rest, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, "", fmt.Errorf("failed to read sidecar body: %w", err)
+		}
+		data = append(buf[:n], rest...)
+	} else {
+		var err error
+		data, err = io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, "", fmt.Errorf("failed to read sidecar body: %w", err)
+		}
 	}
 
 	isVideo := strings.HasPrefix(strings.ToLower(ct), "video/") || isVideoMagicBytes(data)
