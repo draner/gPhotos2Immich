@@ -570,11 +570,11 @@ func hasMotionPhotoXMP(data []byte) bool {
 }
 
 // ExtractMotionPhoto checks if a JPEG contains an embedded MP4 video.
-// Only strips motion photo XMP when markers are found, preserving original bytes
-// for regular photos (checksum-based dedup).
-func ExtractMotionPhoto(data []byte, logger *slog.Logger) ([]byte, []byte, bool) {
+// Returns hadMotionXMP=true when motion markers are present even if no video payload
+// is embedded in the image bytes.
+func ExtractMotionPhoto(data []byte, logger *slog.Logger) ([]byte, []byte, bool, bool) {
 	if !hasMotionPhotoXMP(data) {
-		return data, nil, false
+		return data, nil, false, false
 	}
 
 	// Check if actual video data is embedded
@@ -599,16 +599,16 @@ func ExtractMotionPhoto(data []byte, logger *slog.Logger) ([]byte, []byte, bool)
 				"video_size", videoSize,
 				"ftyp_offset", lastFtyp,
 			)
-			return imageData, videoData, true
+			return imageData, videoData, true, true
 		}
 	}
 
-	// Has motion photo XMP but no valid embedded video — strip XMP flags
-	logger.Debug("Motion photo XMP found but no embedded video, stripping XMP flags",
+	// Has motion photo XMP but no valid embedded video in the container bytes.
+	// Caller may attempt sidecar download (=dv) before deciding to strip XMP.
+	logger.Debug("Motion photo XMP found but no embedded video",
 		"file_size", len(data),
 	)
-	StripMotionPhotoXMP(data)
-	return data, nil, false
+	return data, nil, false, true
 }
 
 // StripMotionPhotoXMP disables motion photo flags in XMP metadata (same-length replacements)
@@ -719,6 +719,49 @@ func DownloadMedia(ctx context.Context, client *Client, baseUrl string) ([]byte,
 		// =dv failed, fall through and use the =d data as-is
 	}
 
+	// Some Google Photos shared-album video items may return an image poster on =d.
+	// If this is not a motion-photo container, probe =dv and treat valid video as the primary asset.
+	if !hasMotionPhotoXMP(data) {
+		if sidecarData, sidecarExt, sidecarErr := DownloadMotionVideoSidecar(ctx, client, baseUrl); sidecarErr == nil {
+			return sidecarData, sidecarExt, true, nil
+		}
+	}
+
 	ext := extensionFromContentType(ct)
 	return data, ext, false, nil
+}
+
+// DownloadMotionVideoSidecar fetches the motion sidecar stream (if present) for an image item.
+func DownloadMotionVideoSidecar(ctx context.Context, client *Client, baseUrl string) ([]byte, string, error) {
+	// Keep sidecar probing bounded to avoid stalling worker goroutines.
+	sidecarCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	resp, err := client.Get(sidecarCtx, baseUrl+"=dv")
+	if err != nil {
+		return nil, "", fmt.Errorf("sidecar download failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, "", fmt.Errorf("sidecar download returned status %d", resp.StatusCode)
+	}
+
+	ct := resp.Header.Get("Content-Type")
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to read sidecar body: %w", err)
+	}
+
+	isVideo := strings.HasPrefix(strings.ToLower(ct), "video/") || isVideoMagicBytes(data)
+	if !isVideo || len(data) <= 1024 {
+		return nil, "", fmt.Errorf("sidecar is not a valid video payload")
+	}
+
+	ext := extensionFromContentType(ct)
+	if ext == "" || ext == ".jpg" {
+		ext = ".mp4"
+	}
+
+	return data, ext, nil
 }

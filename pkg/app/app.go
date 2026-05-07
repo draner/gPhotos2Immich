@@ -438,7 +438,30 @@ func (a *App) processItem(ctx context.Context, p googlephotos.Photo, albumTitle,
 
 	// Handle motion photos for images
 	if !isVideo {
-		imageData, videoData, isMotion := googlephotos.ExtractMotionPhoto(data, a.Logger)
+		imageData, videoData, isMotion, hadMotionXMP := googlephotos.ExtractMotionPhoto(data, a.Logger)
+		motionVideoExt := ".mp4"
+
+		// Some Google motion photos expose video as sidecar (=dv) instead of embedded bytes.
+		if !isMotion && hadMotionXMP {
+			sidecarData, sidecarExt, sidecarErr := googlephotos.DownloadMotionVideoSidecar(ctx, a.GPClient, p.URL)
+			if sidecarErr == nil {
+				videoData = sidecarData
+				isMotion = true
+				if sidecarExt != "" {
+					motionVideoExt = sidecarExt
+				}
+				a.Logger.Debug("Motion photo sidecar downloaded",
+					"id", safeId,
+					"video_size", len(videoData),
+				)
+			} else {
+				a.Logger.Debug("Motion XMP found but sidecar unavailable, stripping XMP flags",
+					"id", safeId,
+					"error", sidecarErr,
+				)
+				googlephotos.StripMotionPhotoXMP(imageData)
+			}
+		}
 
 		if isMotion {
 			a.Logger.Debug("Detected motion photo",
@@ -448,8 +471,11 @@ func (a *App) processItem(ctx context.Context, p googlephotos.Photo, albumTitle,
 			)
 
 			// Upload the video part first
-			videoFilename := baseName + ".mp4"
-			videoId, videoDup, videoErr := a.Client.UploadAssetWithVisibility(ctx,
+			videoFilename := baseName + motionVideoExt
+			motionUploadCtx, motionUploadCancel := context.WithTimeout(ctx, 90*time.Second)
+			defer motionUploadCancel()
+
+			videoId, videoDup, videoErr := a.Client.UploadAssetWithVisibility(motionUploadCtx,
 				videoData, videoFilename, p.TakenAt, "", "hidden")
 			if videoErr != nil {
 				a.Logger.Warn("Failed to upload motion video, uploading image as static photo", "error", videoErr)
@@ -461,10 +487,15 @@ func (a *App) processItem(ctx context.Context, p googlephotos.Photo, albumTitle,
 			var uploadedId string
 			var isDup bool
 			if videoId != "" {
-				uploadedId, isDup, err = a.Client.UploadAssetWithLive(ctx,
+				uploadedId, isDup, err = a.Client.UploadAssetWithLive(motionUploadCtx,
 					imageData, filename, p.TakenAt, description, videoId)
+				if err != nil {
+					a.Logger.Warn("Live photo upload failed or timed out, retrying as static image", "id", safeId, "error", err)
+					uploadedId, isDup, err = a.Client.UploadAsset(motionUploadCtx,
+						imageData, filename, p.TakenAt, description)
+				}
 			} else {
-				uploadedId, isDup, err = a.Client.UploadAsset(ctx,
+				uploadedId, isDup, err = a.Client.UploadAsset(motionUploadCtx,
 					imageData, filename, p.TakenAt, description)
 			}
 			if err != nil {
@@ -477,6 +508,13 @@ func (a *App) processItem(ctx context.Context, p googlephotos.Photo, albumTitle,
 			bytesUploaded := int64(len(imageData) + len(videoData))
 			a.State.Set(baseName, uploadedId)
 			if isDup {
+				if videoId != "" {
+					linkCtx, linkCancel := context.WithTimeout(ctx, 10*time.Second)
+					defer linkCancel()
+					if linkErr := a.Client.LinkLivePhotoToAsset(linkCtx, uploadedId, videoId); linkErr != nil {
+						a.Logger.Warn("Failed to link deduplicated photo with motion video", "photo_id", uploadedId, "video_id", videoId, "error", linkErr)
+					}
+				}
 				a.Logger.Debug("Motion photo deduplicated by Immich", "filename", filename, "id", uploadedId)
 				return uploadedId, false, bytesDownloaded, bytesUploaded, nil
 			}

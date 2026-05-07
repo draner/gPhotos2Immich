@@ -324,6 +324,26 @@ func (c *Client) GetUser(ctx context.Context) (string, string, error) {
 	return user.Id, user.Name, err
 }
 
+// LinkLivePhotoToAsset associates an existing image asset with a motion video asset.
+func (c *Client) LinkLivePhotoToAsset(ctx context.Context, assetId string, livePhotoVideoId string) error {
+	if assetId == "" || livePhotoVideoId == "" {
+		return fmt.Errorf("assetId and livePhotoVideoId are required")
+	}
+
+	payload := map[string]string{"livePhotoVideoId": livePhotoVideoId}
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal live photo link payload: %w", err)
+	}
+
+	_, err = c.request(ctx, "PUT", fmt.Sprintf("assets/%s", assetId), jsonPayload, "")
+	if err != nil {
+		return fmt.Errorf("failed to link live photo video to asset %s: %w", assetId, err)
+	}
+
+	return nil
+}
+
 // SearchAssetsByDevice fetches all assets uploaded by the given deviceId.
 // Returns a map of baseName (without extension) -> asset ID.
 func (c *Client) SearchAssetsByDevice(ctx context.Context, deviceId string) (map[string]string, error) {
