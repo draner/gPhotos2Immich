@@ -733,11 +733,7 @@ func DownloadMedia(ctx context.Context, client *Client, baseUrl string) ([]byte,
 
 // DownloadMotionVideoSidecar fetches the motion sidecar stream (if present) for an image item.
 func DownloadMotionVideoSidecar(ctx context.Context, client *Client, baseUrl string) ([]byte, string, error) {
-	// Keep sidecar probing bounded to avoid stalling worker goroutines.
-	sidecarCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-
-	resp, err := client.Get(sidecarCtx, baseUrl+"=dv")
+	resp, err := client.Get(ctx, baseUrl+"=dv")
 	if err != nil {
 		return nil, "", fmt.Errorf("sidecar download failed: %w", err)
 	}

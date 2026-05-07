@@ -472,10 +472,7 @@ func (a *App) processItem(ctx context.Context, p googlephotos.Photo, albumTitle,
 
 			// Upload the video part first
 			videoFilename := baseName + motionVideoExt
-			motionUploadCtx, motionUploadCancel := context.WithTimeout(ctx, 90*time.Second)
-			defer motionUploadCancel()
-
-			videoId, videoDup, videoErr := a.Client.UploadAssetWithVisibility(motionUploadCtx,
+			videoId, videoDup, videoErr := a.Client.UploadAssetWithVisibility(ctx,
 				videoData, videoFilename, p.TakenAt, "", "hidden")
 			if videoErr != nil {
 				a.Logger.Warn("Failed to upload motion video, uploading image as static photo", "error", videoErr)
@@ -487,15 +484,10 @@ func (a *App) processItem(ctx context.Context, p googlephotos.Photo, albumTitle,
 			var uploadedId string
 			var isDup bool
 			if videoId != "" {
-				uploadedId, isDup, err = a.Client.UploadAssetWithLive(motionUploadCtx,
+				uploadedId, isDup, err = a.Client.UploadAssetWithLive(ctx,
 					imageData, filename, p.TakenAt, description, videoId)
-				if err != nil {
-					a.Logger.Warn("Live photo upload failed or timed out, retrying as static image", "id", safeId, "error", err)
-					uploadedId, isDup, err = a.Client.UploadAsset(motionUploadCtx,
-						imageData, filename, p.TakenAt, description)
-				}
 			} else {
-				uploadedId, isDup, err = a.Client.UploadAsset(motionUploadCtx,
+				uploadedId, isDup, err = a.Client.UploadAsset(ctx,
 					imageData, filename, p.TakenAt, description)
 			}
 			if err != nil {
@@ -504,17 +496,15 @@ func (a *App) processItem(ctx context.Context, p googlephotos.Photo, albumTitle,
 			if uploadedId == "" {
 				return "", false, bytesDownloaded, 0, fmt.Errorf("upload returned empty ID for %s", filename)
 			}
+			if videoId != "" {
+				if linkErr := a.Client.LinkLivePhotoToAsset(ctx, uploadedId, videoId); linkErr != nil {
+					a.Logger.Warn("Failed to link motion video to uploaded photo", "photo_id", uploadedId, "video_id", videoId, "error", linkErr)
+				}
+			}
 
 			bytesUploaded := int64(len(imageData) + len(videoData))
 			a.State.Set(baseName, uploadedId)
 			if isDup {
-				if videoId != "" {
-					linkCtx, linkCancel := context.WithTimeout(ctx, 10*time.Second)
-					defer linkCancel()
-					if linkErr := a.Client.LinkLivePhotoToAsset(linkCtx, uploadedId, videoId); linkErr != nil {
-						a.Logger.Warn("Failed to link deduplicated photo with motion video", "photo_id", uploadedId, "video_id", videoId, "error", linkErr)
-					}
-				}
 				a.Logger.Debug("Motion photo deduplicated by Immich", "filename", filename, "id", uploadedId)
 				return uploadedId, false, bytesDownloaded, bytesUploaded, nil
 			}
