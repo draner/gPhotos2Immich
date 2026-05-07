@@ -694,13 +694,35 @@ func DownloadMedia(ctx context.Context, client *Client, baseUrl string) ([]byte,
 	}
 
 	ct := resp.Header.Get("Content-Type")
+	// If =d is already a video response, avoid reading that whole body unless we
+	// have to fall back to it. Prefer =dv for the actual playable payload.
+	if strings.HasPrefix(strings.ToLower(ct), "video/") {
+		resp2, err := client.Get(ctx, baseUrl+"=dv")
+		if err != nil {
+			defer resp.Body.Close()
+			return nil, "", false, fmt.Errorf("video re-download failed: %w", err)
+		}
+		defer resp2.Body.Close()
+		if resp2.StatusCode == 200 {
+			videoCt := resp2.Header.Get("Content-Type")
+			videoData, err := io.ReadAll(resp2.Body)
+			if err != nil {
+				resp.Body.Close()
+				return nil, "", false, fmt.Errorf("failed to read video response body: %w", err)
+			}
+			resp.Body.Close()
+			ext := extensionFromContentType(videoCt)
+			return videoData, ext, true, nil
+		}
+	}
+
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, "", false, fmt.Errorf("failed to read response body: %w", err)
 	}
 
 	// If =d is actually a video item, prefer =dv for the original video stream.
-	isVideo := strings.HasPrefix(strings.ToLower(ct), "video/") || isVideoMagicBytes(data)
+	isVideo := isVideoMagicBytes(data)
 	if isVideo {
 		resp2, err := client.Get(ctx, baseUrl+"=dv")
 		if err != nil {
